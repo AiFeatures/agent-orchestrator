@@ -1,6 +1,6 @@
 # Fork Customizations
 
-> This repository is a fork of [unknown]().
+> This repository is a fork of [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator).
 > Managed under the [iAiFy Enterprise](https://github.com/enterprises/iAiFy) governance model.
 
 ## Purpose
@@ -11,7 +11,7 @@
 
 | Property | Value |
 |----------|-------|
-| Upstream | [unknown]() |
+| Upstream | [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator) |
 | Language | TypeScript |
 | Fork org | AiFeatures |
 
