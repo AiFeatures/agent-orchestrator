@@ -15,7 +15,7 @@ import type { FitAddon as FitAddonType } from "@xterm/addon-fit";
 interface DirectTerminalProps {
   sessionId: string;
   startFullscreen?: boolean;
-  /** Visual variant. "orchestrator" uses violet accent; "agent" (default) uses blue. */
+  /** Visual variant. Orchestrator keeps the same design-system blue accent as the rest of the app. */
   variant?: "agent" | "orchestrator";
   /** CSS height for the terminal container in normal (non-fullscreen) mode.
    *  Defaults to "max(440px, calc(100vh - 440px))". */
@@ -38,7 +38,39 @@ interface DirectTerminalWsUrlOptions {
   directTerminalPort?: string;
 }
 
+interface RuntimeTerminalConfigResponse {
+  directTerminalPort?: unknown;
+  proxyWsPath?: unknown;
+}
+
+interface TerminalConnectionConfig {
+  directTerminalPort?: string;
+  proxyWsPath?: string;
+}
+
 type TerminalVariant = "agent" | "orchestrator";
+
+function normalizePortValue(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 65535) return undefined;
+  return String(parsed);
+}
+
+function normalizePathValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("/")) return undefined;
+  return trimmed;
+}
+
+function parseRuntimeTerminalConfig(payload: unknown): TerminalConnectionConfig {
+  const response = (payload ?? {}) as RuntimeTerminalConfigResponse;
+  return {
+    directTerminalPort: normalizePortValue(response.directTerminalPort),
+    proxyWsPath: normalizePathValue(response.proxyWsPath),
+  };
+}
 
 export function buildTerminalThemes(variant: TerminalVariant): { dark: ITheme; light: ITheme } {
   const agentAccent = {
@@ -46,11 +78,7 @@ export function buildTerminalThemes(variant: TerminalVariant): { dark: ITheme; l
     selDark: "rgba(91, 126, 248, 0.30)",
     selLight: "rgba(91, 126, 248, 0.25)",
   };
-  const orchAccent = {
-    cursor: "#a371f7",
-    selDark: "rgba(163, 113, 247, 0.25)",
-    selLight: "rgba(130, 80, 223, 0.20)",
-  };
+  const orchAccent = agentAccent;
   const accent = variant === "orchestrator" ? orchAccent : agentAccent;
 
   const dark: ITheme = {
@@ -142,7 +170,7 @@ export function DirectTerminal({
   sessionId,
   startFullscreen = false,
   variant = "agent",
-  height = "max(440px, calc(100vh - 440px))",
+  height = "max(440px, calc(100dvh - 440px))",
   isOpenCodeSession = false,
   reloadCommand,
 }: DirectTerminalProps) {
@@ -312,15 +340,10 @@ export function DirectTerminal({
         // Fit terminal to container
         fit.fit();
 
-        // WebSocket URL (stable across reconnects)
-        // When accessed via reverse proxy (HTTPS on standard port), use path-based
-        // WebSocket endpoint instead of direct port access.
-        const wsUrl = buildDirectTerminalWsUrl({
-          location: window.location,
-          sessionId,
-          proxyWsPath: process.env.NEXT_PUBLIC_TERMINAL_WS_PATH,
-          directTerminalPort: process.env.NEXT_PUBLIC_DIRECT_TERMINAL_PORT,
-        });
+        // Runtime WS config cache. We do not rely on build-time NEXT_PUBLIC_* here
+        // because `ao start` can choose terminal ports dynamically at runtime.
+        const runtimeConnectionConfig: TerminalConnectionConfig = {};
+        let runtimeFetchDone = false;
 
         // ── Preserve selection while terminal receives output ────────
         // xterm.js clears the selection on every terminal.write(). We
@@ -405,8 +428,52 @@ export function DirectTerminal({
           }
         });
 
-        function connectWebSocket() {
+        async function resolveConnectionConfig(): Promise<TerminalConnectionConfig> {
+          const fromBuild: TerminalConnectionConfig = {
+            proxyWsPath: normalizePathValue(process.env.NEXT_PUBLIC_TERMINAL_WS_PATH),
+            directTerminalPort: normalizePortValue(process.env.NEXT_PUBLIC_DIRECT_TERMINAL_PORT),
+          };
+
+          if (!fromBuild.proxyWsPath && !runtimeFetchDone) {
+            runtimeFetchDone = true;
+            const controller = new AbortController();
+            const fetchTimeout = setTimeout(() => controller.abort(), 1500);
+            try {
+              const response = await fetch("/api/runtime/terminal", {
+                cache: "no-store",
+                signal: controller.signal,
+              });
+              if (response.ok) {
+                const runtimeConfig = parseRuntimeTerminalConfig(await response.json());
+                runtimeConnectionConfig.proxyWsPath = runtimeConfig.proxyWsPath;
+                runtimeConnectionConfig.directTerminalPort = runtimeConfig.directTerminalPort;
+              }
+            } catch {
+              // Runtime config endpoint is optional (timeout or network failure); fallback to build-time values.
+            } finally {
+              clearTimeout(fetchTimeout);
+            }
+          }
+
+          return {
+            proxyWsPath: runtimeConnectionConfig.proxyWsPath ?? fromBuild.proxyWsPath,
+            directTerminalPort:
+              runtimeConnectionConfig.directTerminalPort ?? fromBuild.directTerminalPort,
+          };
+        }
+
+        async function connectWebSocket() {
           if (!mounted) return;
+
+          const config = await resolveConnectionConfig();
+          if (!mounted) return;
+
+          const wsUrl = buildDirectTerminalWsUrl({
+            location: window.location,
+            sessionId,
+            proxyWsPath: config.proxyWsPath,
+            directTerminalPort: config.directTerminalPort,
+          });
 
           console.log("[DirectTerminal] Connecting to:", wsUrl);
           const websocket = new WebSocket(wsUrl);
@@ -471,11 +538,13 @@ export function DirectTerminal({
             setStatus("connecting");
             setError(null);
 
-            reconnectTimerRef.current = setTimeout(connectWebSocket, delay);
+            reconnectTimerRef.current = setTimeout(() => {
+              void connectWebSocket();
+            }, delay);
           };
         }
 
-        connectWebSocket();
+        void connectWebSocket();
 
         // Store cleanup function to be called from useEffect cleanup
         cleanup = () => {
@@ -609,8 +678,7 @@ export function DirectTerminal({
     };
   }, [fullscreen]);
 
-  const accentColor =
-    variant === "orchestrator" ? "var(--color-accent-violet)" : "var(--color-accent)";
+  const accentColor = "var(--color-accent)";
 
   const statusDotClass =
     status === "connected"
@@ -748,7 +816,7 @@ export function DirectTerminal({
           overflow: "hidden",
           display: "flex",
           flexDirection: "column",
-          height: fullscreen ? "calc(100vh - 37px)" : height,
+          height: fullscreen ? "calc(100dvh - 37px)" : height,
         }}
       />
     </div>

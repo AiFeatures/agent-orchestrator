@@ -28,6 +28,8 @@ import {
   generateConfigFromUrl,
   configToYaml,
   normalizeOrchestratorSessionStrategy,
+  isOrchestratorSession,
+  isTerminalSession,
   ConfigNotFoundError,
   type OrchestratorConfig,
   type ProjectConfig,
@@ -41,24 +43,31 @@ import {
   findWebDir,
   buildDashboardEnv,
   waitForPortAndOpen,
+  openUrl,
   isPortAvailable,
   findFreePort,
   MAX_PORT_SCAN,
 } from "../lib/web-dir.js";
-import { cleanNextCache } from "../lib/dashboard-rebuild.js";
+import { rebuildDashboardProductionArtifacts } from "../lib/dashboard-rebuild.js";
 import { preflight } from "../lib/preflight.js";
 import { register, unregister, isAlreadyRunning, getRunning, waitForExit } from "../lib/running-state.js";
 import { isHumanCaller } from "../lib/caller-context.js";
 import { detectEnvironment } from "../lib/detect-env.js";
-import { detectAgentRuntime } from "../lib/detect-agent.js";
+import { detectAgentRuntime, detectAvailableAgents, type DetectedAgent } from "../lib/detect-agent.js";
 import { detectDefaultBranch } from "../lib/git-utils.js";
+import { promptConfirm, promptSelect } from "../lib/prompts.js";
 import {
   detectProjectType,
   generateRulesFromTemplates,
   formatProjectTypeForDisplay,
 } from "../lib/project-detection.js";
+import { formatCommandError } from "../lib/cli-errors.js";
+import { detectOpenClawInstallation } from "../lib/openclaw-probe.js";
+import { applyOpenClawCredentials } from "../lib/credential-resolver.js";
+import { findProjectForDirectory } from "../lib/project-resolution.js";
 
 const DEFAULT_PORT = 3000;
+const IS_TTY = Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
 // =============================================================================
 // HELPERS
@@ -69,10 +78,11 @@ const DEFAULT_PORT = 3000;
  * If projectArg is provided, use it. If only one project exists, use that.
  * Otherwise, error with helpful message.
  */
-function resolveProject(
+async function resolveProject(
   config: OrchestratorConfig,
   projectArg?: string,
-): { projectId: string; project: ProjectConfig } {
+  action = "start",
+): Promise<{ projectId: string; project: ProjectConfig }> {
   const projectIds = Object.keys(config.projects);
 
   if (projectIds.length === 0) {
@@ -99,16 +109,27 @@ function resolveProject(
   // Multiple projects — try matching cwd to a project path
   // Note: loadConfig() already expands ~ in project paths via expandPaths()
   const currentDir = resolve(cwd());
-  for (const [id, proj] of Object.entries(config.projects)) {
-    if (resolve(proj.path) === currentDir) {
-      return { projectId: id, project: proj };
-    }
+  const matchedProjectId = findProjectForDirectory(config.projects, currentDir);
+  if (matchedProjectId) {
+    return { projectId: matchedProjectId, project: config.projects[matchedProjectId] };
   }
 
-  // No match — error with helpful message
-  throw new Error(
-    `Multiple projects configured. Specify which one to start:\n  ${projectIds.map((id) => `ao start ${id}`).join("\n  ")}`,
-  );
+  // No match — prompt if interactive, otherwise error
+  if (isHumanCaller()) {
+    const projectId = await promptSelect(
+      `Choose project to ${action}:`,
+      projectIds.map((id) => ({
+        value: id,
+        label: config.projects[id].name ?? id,
+        hint: id,
+      })),
+    );
+    return { projectId, project: config.projects[projectId] };
+  } else {
+    throw new Error(
+      `Multiple projects configured. Specify which one to ${action}:\n  ${projectIds.map((id) => `ao ${action} ${id}`).join("\n  ")}`,
+    );
+  }
 }
 
 /**
@@ -119,10 +140,10 @@ function resolveProject(
  * Falls back to `resolveProject` (which handles single-project configs or
  * errors with a helpful message for ambiguous multi-project cases).
  */
-function resolveProjectByRepo(
+async function resolveProjectByRepo(
   config: OrchestratorConfig,
   parsed: ParsedRepoUrl,
-): { projectId: string; project: ProjectConfig } {
+): Promise<{ projectId: string; project: ProjectConfig }> {
   const projectIds = Object.keys(config.projects);
 
   // Try to match by repo field (e.g. "owner/repo")
@@ -134,7 +155,264 @@ function resolveProjectByRepo(
   }
 
   // No repo match — fall back to standard resolution (works for single-project)
-  return resolveProject(config);
+  return await resolveProject(config);
+}
+
+interface InstallAttempt {
+  cmd: string;
+  args: string[];
+  label: string;
+}
+
+function canPromptForInstall(): boolean {
+  return isHumanCaller() && IS_TTY;
+}
+
+function genericInstallHints(command: string): string[] {
+  switch (command) {
+    case "node":
+    case "npm":
+      return ["Install Node.js/npm from https://nodejs.org/"];
+    case "pnpm":
+      return [
+        "corepack enable && corepack prepare pnpm@latest --activate",
+        "npm install -g pnpm",
+      ];
+    case "pipx":
+      return [
+        "python3 -m pip install --user pipx",
+        "python3 -m pipx ensurepath",
+      ];
+    default:
+      return [];
+  }
+}
+
+/**
+ * Prompt the user to optionally switch orchestrator/worker agents at startup.
+ * Shows only agents detected on the current system (reuses detectAvailableAgents).
+ * Returns the chosen agents
+ */
+async function promptAgentSelection(): Promise<{
+  orchestratorAgent: string;
+  workerAgent: string
+} | null> {
+  if (canPromptForInstall()) {
+    const available = await detectAvailableAgents();
+    if (available.length === 0) {
+      console.log(chalk.yellow("No agent runtimes detected — using existing config."));
+      return null;
+    }
+
+    const agentOptions = available.map((a) => ({ value: a.name, label: a.displayName }));
+
+    const orchestratorAgent = await promptSelect("Orchestrator agent:", agentOptions);
+    const workerAgent = await promptSelect("Worker agent:", agentOptions);
+
+    return { orchestratorAgent, workerAgent };
+  } else {
+    return null;
+  }
+}
+
+async function askYesNo(
+  question: string,
+  defaultYes = true,
+  nonInteractiveDefault = defaultYes,
+): Promise<boolean> {
+  if (!canPromptForInstall()) return nonInteractiveDefault;
+  return await promptConfirm(question, defaultYes);
+}
+
+function gitInstallAttempts(): InstallAttempt[] {
+  if (process.platform === "darwin") {
+    return [{ cmd: "brew", args: ["install", "git"], label: "brew install git" }];
+  }
+  if (process.platform === "linux") {
+    return [
+      { cmd: "sudo", args: ["apt-get", "install", "-y", "git"], label: "sudo apt-get install -y git" },
+      { cmd: "sudo", args: ["dnf", "install", "-y", "git"], label: "sudo dnf install -y git" },
+    ];
+  }
+  if (process.platform === "win32") {
+    return [
+      {
+        cmd: "winget",
+        args: ["install", "--id", "Git.Git", "-e", "--source", "winget"],
+        label: "winget install --id Git.Git -e --source winget",
+      },
+    ];
+  }
+  return [];
+}
+
+function gitInstallHints(): string[] {
+  if (process.platform === "darwin") return ["brew install git"];
+  if (process.platform === "win32") return ["winget install --id Git.Git -e --source winget"];
+  return [
+    "sudo apt install git      # Debian/Ubuntu",
+    "sudo dnf install git      # Fedora/RHEL",
+  ];
+}
+
+function ghInstallAttempts(): InstallAttempt[] {
+  if (process.platform === "darwin") {
+    return [{ cmd: "brew", args: ["install", "gh"], label: "brew install gh" }];
+  }
+  if (process.platform === "linux") {
+    return [
+      { cmd: "sudo", args: ["apt-get", "install", "-y", "gh"], label: "sudo apt-get install -y gh" },
+      { cmd: "sudo", args: ["dnf", "install", "-y", "gh"], label: "sudo dnf install -y gh" },
+    ];
+  }
+  if (process.platform === "win32") {
+    return [
+      {
+        cmd: "winget",
+        args: ["install", "--id", "GitHub.cli", "-e", "--source", "winget"],
+        label: "winget install --id GitHub.cli -e --source winget",
+      },
+    ];
+  }
+  return [];
+}
+
+async function runInteractiveCommand(cmd: string, args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: "inherit" });
+    child.once("error", (err) => {
+      reject(
+        formatCommandError(err, {
+          cmd,
+          args,
+          action: "run an interactive installer",
+          installHints: genericInstallHints(cmd),
+        }),
+      );
+    });
+    child.once("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Command failed (${code ?? "unknown"}): ${cmd} ${args.join(" ")}`));
+    });
+  });
+}
+
+async function tryInstallWithAttempts(
+  attempts: InstallAttempt[],
+  verify: () => Promise<boolean>,
+): Promise<boolean> {
+  for (const attempt of attempts) {
+    try {
+      console.log(chalk.dim(`  Running: ${attempt.label}`));
+      await runInteractiveCommand(attempt.cmd, attempt.args);
+      if (await verify()) return true;
+    } catch {
+      // Try next installer
+    }
+  }
+  return verify();
+}
+
+async function ensureGit(context: string): Promise<void> {
+  const hasGit = (await execSilent("git", ["--version"])) !== null;
+  if (hasGit) return;
+
+  console.log(chalk.yellow(`⚠ Git is required for ${context}.`));
+  const shouldInstall = await askYesNo("Install Git now?", true, false);
+  if (shouldInstall) {
+    const installed = await tryInstallWithAttempts(
+      gitInstallAttempts(),
+      async () => (await execSilent("git", ["--version"])) !== null,
+    );
+    if (installed) {
+      console.log(chalk.green("  ✓ Git installed successfully"));
+      return;
+    }
+  }
+
+  console.error(chalk.red("\n✗ Git is required but is not installed.\n"));
+  console.log(chalk.bold("  Install Git manually, then re-run ao start:\n"));
+  for (const hint of gitInstallHints()) {
+    console.log(chalk.cyan(`    ${hint}`));
+  }
+  console.log();
+  process.exit(1);
+}
+
+interface AgentInstallOption {
+  id: string;
+  label: string;
+  cmd: string;
+  args: string[];
+}
+
+const AGENT_INSTALL_OPTIONS: AgentInstallOption[] = [
+  {
+    id: "claude-code",
+    label: "Claude Code",
+    cmd: "npm",
+    args: ["install", "-g", "@anthropic-ai/claude-code"],
+  },
+  {
+    id: "codex",
+    label: "OpenAI Codex",
+    cmd: "npm",
+    args: ["install", "-g", "@openai/codex"],
+  },
+  {
+    id: "aider",
+    label: "Aider",
+    cmd: "pipx",
+    args: ["install", "aider-chat"],
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    cmd: "npm",
+    args: ["install", "-g", "opencode-ai"],
+  },
+];
+
+async function promptInstallAgentRuntime(available: DetectedAgent[]): Promise<DetectedAgent[]> {
+  if (available.length > 0 || !canPromptForInstall()) return available;
+
+  console.log(chalk.yellow("⚠ No supported agent runtime detected."));
+  console.log(chalk.dim("  You can install one now (recommended) or continue and install later.\n"));
+  const choice = await promptSelect(
+    "Choose runtime to install:",
+    [
+      ...AGENT_INSTALL_OPTIONS.map((option) => ({
+        value: option.id,
+        label: option.label,
+        hint: [option.cmd, ...option.args].join(" "),
+      })),
+      { value: "skip", label: "Skip for now" },
+    ],
+  );
+  if (choice === "skip") {
+    return available;
+  }
+
+  const selected = AGENT_INSTALL_OPTIONS.find((option) => option.id === choice);
+  if (!selected) {
+    return available;
+  }
+
+  console.log(chalk.dim(`  Installing ${selected.label}...`));
+  try {
+    await runInteractiveCommand(selected.cmd, selected.args);
+    const refreshed = await detectAvailableAgents();
+    if (refreshed.length > 0) {
+      console.log(chalk.green(`  ✓ ${selected.label} installed successfully`));
+    }
+    return refreshed;
+  } catch {
+    console.log(chalk.yellow(`  ⚠ Could not install ${selected.label} automatically.`));
+    return available;
+  }
 }
 
 /**
@@ -191,6 +469,8 @@ async function handleUrlStart(
   spinner.start("Parsing repository URL");
   const parsed = parseRepoUrl(url);
   spinner.succeed(`Repository: ${chalk.cyan(parsed.ownerRepo)} (${parsed.host})`);
+
+  await ensureGit("repository cloning");
 
   // 2. Determine target directory
   const cwd = process.cwd();
@@ -286,7 +566,9 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
   const defaultBranch = env.defaultBranch || "main";
 
   // Detect available agent runtimes via plugin registry
-  const agent = await detectAgentRuntime();
+  let detectedAgents = await detectAvailableAgents();
+  detectedAgents = await promptInstallAgentRuntime(detectedAgents);
+  const agent = await detectAgentRuntime(detectedAgents);
   console.log(chalk.green(`  ✓ Agent runtime: ${agent}`));
 
   const port = await findFreePort(DEFAULT_PORT);
@@ -300,7 +582,7 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
       runtime: "tmux",
       agent,
       workspace: "worktree",
-      notifiers: ["desktop"],
+      notifiers: [],
     },
     projects: {
       [projectId]: {
@@ -331,7 +613,23 @@ async function autoCreateConfig(workingDir: string): Promise<OrchestratorConfig>
   }
 
   if (!env.hasTmux) {
-    console.log(chalk.yellow("⚠ tmux not found — install with: brew install tmux"));
+    console.log(chalk.yellow("⚠ tmux not found — will prompt to install at startup"));
+  }
+  if (!env.hasGh) {
+    console.log(chalk.yellow("⚠ GitHub CLI (gh) not found — optional, but recommended for GitHub workflows."));
+    const shouldInstallGh = await askYesNo("Install GitHub CLI now?", false);
+    if (shouldInstallGh) {
+      const installedGh = await tryInstallWithAttempts(
+        ghInstallAttempts(),
+        async () => (await execSilent("gh", ["--version"])) !== null,
+      );
+      if (installedGh) {
+        env.hasGh = true;
+        console.log(chalk.green("  ✓ GitHub CLI installed successfully"));
+      } else {
+        console.log(chalk.yellow("  ⚠ Could not install GitHub CLI automatically."));
+      }
+    }
   }
   if (!env.ghAuthed && env.hasGh) {
     console.log(chalk.yellow("⚠ GitHub CLI not authenticated — run: gh auth login"));
@@ -349,6 +647,8 @@ async function addProjectToConfig(
   config: OrchestratorConfig,
   projectPath: string,
 ): Promise<string> {
+  await ensureGit("adding projects");
+
   const resolvedPath = resolve(projectPath.replace(/^~/, process.env["HOME"] || ""));
   let projectId = basename(resolvedPath);
 
@@ -449,22 +749,29 @@ export async function createConfigOnly(): Promise<void> {
  * Start dashboard server in the background.
  * Returns the child process handle for cleanup.
  */
+/* c8 ignore start -- process-spawning startup code, tested via integration/onboarding */
 async function startDashboard(
   port: number,
   webDir: string,
   configPath: string | null,
   terminalPort?: number,
   directTerminalPort?: number,
+  devMode?: boolean,
 ): Promise<ChildProcess> {
   const env = await buildDashboardEnv(port, configPath, terminalPort, directTerminalPort);
 
-  // Detect dev vs production: the `server/` source directory only exists in the
-  // monorepo. Published npm packages only have `dist-server/`.
-  const isDevMode = existsSync(resolve(webDir, "server"));
+  // Detect monorepo vs npm install: the `server/` source directory only exists
+  // in the monorepo. Published npm packages only have `dist-server/`.
+  const isMonorepo = existsSync(resolve(webDir, "server"));
+
+  // In monorepo: use HMR dev server only when --dev is passed explicitly.
+  // Default is optimized production server for faster loading.
+  const useDevServer = isMonorepo && devMode === true;
 
   let child: ChildProcess;
-  if (isDevMode) {
-    // Monorepo development: use pnpm run dev (tsx, HMR, etc.)
+  if (useDevServer) {
+    // Monorepo with --dev: use pnpm run dev (tsx watch, HMR, etc.)
+    console.log(chalk.dim("  Mode: development (HMR enabled)"));
     child = spawn("pnpm", ["run", "dev"], {
       cwd: webDir,
       stdio: "inherit",
@@ -472,8 +779,13 @@ async function startDashboard(
       env,
     });
   } else {
-    // Production (installed from npm): use pre-built start-all script
-    child = spawn("node", [resolve(webDir, "dist-server", "start-all.js")], {
+    // Production: use pre-built start-all script.
+    if (isMonorepo) {
+      console.log(chalk.dim("  Mode: optimized (production bundles)"));
+      console.log(chalk.dim("  Tip: use --dev for hot reload when editing dashboard UI\n"));
+    }
+    const startScript = resolve(webDir, "dist-server", "start-all.js");
+    child = spawn("node", [startScript], {
       cwd: webDir,
       stdio: "inherit",
       detached: false,
@@ -482,12 +794,114 @@ async function startDashboard(
   }
 
   child.on("error", (err) => {
-    console.error(chalk.red("Dashboard failed to start:"), err.message);
+    const cmd = useDevServer ? "pnpm" : "node";
+    const args = useDevServer ? ["run", "dev"] : [resolve(webDir, "dist-server", "start-all.js")];
+    const formatted = formatCommandError(err, {
+      cmd,
+      args,
+      action: "start the AO dashboard",
+      installHints: genericInstallHints(cmd),
+    });
+    console.error(chalk.red("Dashboard failed to start:"), formatted.message);
     // Emit synthetic exit so callers listening on "exit" can clean up
     child.emit("exit", 1, null);
   });
 
   return child;
+}
+/* c8 ignore stop */
+
+/**
+ * Ensure tmux is available — interactive install with user consent if missing.
+ * Called from runStartup() so ALL ao start
+ * paths (normal, URL, retry with existing config) are covered.
+ */
+function tmuxInstallAttempts(): InstallAttempt[] {
+  if (process.platform === "darwin") {
+    return [{ cmd: "brew", args: ["install", "tmux"], label: "brew install tmux" }];
+  }
+  if (process.platform === "linux") {
+    return [
+      { cmd: "sudo", args: ["apt-get", "install", "-y", "tmux"], label: "sudo apt-get install -y tmux" },
+      { cmd: "sudo", args: ["dnf", "install", "-y", "tmux"], label: "sudo dnf install -y tmux" },
+    ];
+  }
+  return [];
+}
+
+function tmuxInstallHints(): string[] {
+  if (process.platform === "darwin") return ["brew install tmux"];
+  if (process.platform === "win32") return [
+    "# Install WSL first, then inside WSL:",
+    "sudo apt install tmux",
+  ];
+  return [
+    "sudo apt install tmux      # Debian/Ubuntu",
+    "sudo dnf install tmux      # Fedora/RHEL",
+  ];
+}
+
+async function ensureTmux(): Promise<void> {
+  const hasTmux = (await execSilent("tmux", ["-V"])) !== null;
+  if (hasTmux) return;
+
+  console.log(chalk.yellow("⚠ tmux is required for runtime \"tmux\"."));
+  const shouldInstall = await askYesNo("Install tmux now?", true, false);
+  if (shouldInstall) {
+    const installed = await tryInstallWithAttempts(
+      tmuxInstallAttempts(),
+      async () => (await execSilent("tmux", ["-V"])) !== null,
+    );
+    if (installed) {
+      console.log(chalk.green("  ✓ tmux installed successfully"));
+      return;
+    }
+  }
+
+  console.error(chalk.red("\n✗ tmux is required but is not installed.\n"));
+  console.log(chalk.bold("  Install tmux manually, then re-run ao start:\n"));
+  for (const hint of tmuxInstallHints()) {
+    console.log(chalk.cyan(`    ${hint}`));
+  }
+  console.log();
+  process.exit(1);
+}
+
+async function warnAboutOpenClawStatus(config: OrchestratorConfig): Promise<void> {
+  const openclawConfig = config.notifiers?.["openclaw"];
+  const openclawConfigured =
+    openclawConfig !== null && openclawConfig !== undefined &&
+    typeof openclawConfig === "object" &&
+    openclawConfig.plugin === "openclaw";
+  const configuredUrl =
+    openclawConfigured && typeof openclawConfig.url === "string" ? openclawConfig.url : undefined;
+
+  try {
+    const installation = configuredUrl
+      ? await detectOpenClawInstallation(configuredUrl)
+      : await detectOpenClawInstallation();
+
+    if (openclawConfigured) {
+      if (installation.state !== "running") {
+        console.log(
+          chalk.yellow(
+            `⚠ OpenClaw is configured but the gateway is not reachable at ${installation.gatewayUrl}. Notifications may fail until it is running.`,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (installation.state === "running") {
+      console.log(
+        chalk.yellow(
+          `⚠ OpenClaw is running at ${installation.gatewayUrl} but AO is not configured to use it. Run \`ao setup openclaw\` if you want OpenClaw notifications.`,
+        ),
+      );
+    }
+  } catch {
+    // OpenClaw probing is advisory for `ao start`; never block startup on it.
+  }
 }
 
 /**
@@ -498,8 +912,30 @@ async function runStartup(
   config: OrchestratorConfig,
   projectId: string,
   project: ProjectConfig,
-  opts?: { dashboard?: boolean; orchestrator?: boolean; rebuild?: boolean },
+  opts?: { dashboard?: boolean; orchestrator?: boolean; rebuild?: boolean; dev?: boolean },
 ): Promise<number> {
+  // Ensure tmux is available before doing anything — covers all entry paths
+  // (normal start, URL start, retry with existing config)
+  const runtime = config.defaults?.runtime ?? "tmux";
+  if (runtime === "tmux") {
+    await ensureTmux();
+  }
+  await warnAboutOpenClawStatus(config);
+
+  // Only inject OpenClaw credentials when the project actually uses OpenClaw.
+  // This avoids exposing API keys to projects/plugins that don't need them.
+  const openclawNotifier = config.notifiers?.["openclaw"];
+  const hasOpenClaw =
+    openclawNotifier !== null && openclawNotifier !== undefined &&
+    typeof openclawNotifier === "object" && openclawNotifier.plugin === "openclaw";
+  if (hasOpenClaw) {
+    const injectedKeys = applyOpenClawCredentials();
+    if (injectedKeys.length > 0) {
+      const names = injectedKeys.map((k) => k.key).join(", ");
+      console.log(chalk.dim(`  Resolved from OpenClaw config: ${names}`));
+    }
+  }
+
   const sessionId = `${project.sessionPrefix}-orchestrator`;
   const shouldStartLifecycle = opts?.dashboard !== false || opts?.orchestrator !== false;
   let lifecycleStatus: Awaited<ReturnType<typeof ensureLifecycleWorker>> | null = null;
@@ -527,10 +963,15 @@ async function runStartup(
       port = newPort;
     }
     const webDir = findWebDir(); // throws with install-specific guidance if not found
-    await preflight.checkBuilt(webDir);
-
+    // Dev mode (HMR) only works in the monorepo where `server/` source exists.
+    // For npm installs, --dev is silently ignored and production server runs,
+    // so preflight must still verify production artifacts exist.
+    const isMonorepo = existsSync(resolve(webDir, "server"));
+    const willUseDevServer = isMonorepo && opts?.dev === true;
     if (opts?.rebuild) {
-      await cleanNextCache(webDir);
+      await rebuildDashboardProductionArtifacts(webDir);
+    } else if (!willUseDevServer) {
+      await preflight.checkBuilt(webDir);
     }
 
     spinner.start("Starting dashboard");
@@ -540,6 +981,7 @@ async function runStartup(
       config.configPath,
       config.terminalPort,
       config.directTerminalPort,
+      opts?.dev,
     );
     spinner.succeed(`Dashboard starting on http://localhost:${port}`);
     console.log(chalk.dim("  (Dashboard will be ready in a few seconds)\n"));
@@ -566,31 +1008,82 @@ async function runStartup(
     }
   }
 
-  // Create orchestrator session (unless --no-orchestrator or already exists)
+  // Create orchestrator session (unless --no-orchestrator or existing orchestrators found)
   let tmuxTarget = sessionId;
+  let hasExistingOrchestrators = false;
+  let selectedOrchestratorId: string | null = null;
+
   if (opts?.orchestrator !== false) {
     const sm = await getSessionManager(config);
 
+    // Check for existing orchestrator sessions for this project
+    let allSessions;
     try {
-      spinner.start("Creating orchestrator session");
-      const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
-      const session = await sm.spawnOrchestrator({ projectId, systemPrompt });
-      if (session.runtimeHandle?.id) {
-        tmuxTarget = session.runtimeHandle.id;
-      }
-      reused =
-        orchestratorSessionStrategy === "reuse" &&
-        session.metadata?.["orchestratorSessionReused"] === "true";
-      spinner.succeed(reused ? "Orchestrator session reused" : "Orchestrator session created");
+      allSessions = await sm.list(projectId);
     } catch (err) {
-      spinner.fail("Orchestrator setup failed");
+      spinner.fail("Failed to list sessions");
       if (dashboardProcess) {
         dashboardProcess.kill();
       }
       throw new Error(
-        `Failed to setup orchestrator: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to list sessions: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err },
       );
+    }
+    const allSessionPrefixes = Object.entries(config.projects).map(
+      ([, p]) => p.sessionPrefix ?? generateSessionPrefix(p.name ?? ""),
+    );
+    const existingOrchestrators = allSessions.filter(
+      (s) =>
+        isOrchestratorSession(s, project.sessionPrefix ?? projectId, allSessionPrefixes) &&
+        !isTerminalSession(s),
+    );
+
+    if (existingOrchestrators.length > 0) {
+      // Existing orchestrators found — always auto-select the most recently active one.
+      // With a single orchestrator, navigate directly to its session page.
+      // With multiple orchestrators, keep the selection page so the user can choose or spawn a
+      // new one — the dashboard only links to one orchestrator per project, so the selection page
+      // is the only startup path for multi-orchestrator projects.
+      const sortedOrchestrators = [...existingOrchestrators].sort(
+        (a, b) => (b.lastActivityAt?.getTime() ?? 0) - (a.lastActivityAt?.getTime() ?? 0),
+      );
+      const selected = sortedOrchestrators[0];
+      selectedOrchestratorId = selected.id;
+      // Use runtimeHandle.id if available, otherwise fall back to the session ID
+      tmuxTarget = selected.runtimeHandle?.id ?? selected.id;
+      if (opts?.dashboard !== false && existingOrchestrators.length > 1) {
+        hasExistingOrchestrators = true;
+      }
+      spinner.succeed(
+        `Using existing orchestrator session: ${selected.id}` +
+          (existingOrchestrators.length > 1
+            ? ` (${existingOrchestrators.length - 1} other session(s) available)` : ""),
+      );
+    } else {
+      // No existing orchestrators — spawn a new one
+      try {
+        spinner.start("Creating orchestrator session");
+        const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
+        const session = await sm.spawnOrchestrator({ projectId, systemPrompt });
+        selectedOrchestratorId = session.id;
+        if (session.runtimeHandle?.id) {
+          tmuxTarget = session.runtimeHandle.id;
+        }
+        reused =
+          orchestratorSessionStrategy === "reuse" &&
+          session.metadata?.["orchestratorSessionReused"] === "true";
+        spinner.succeed(reused ? "Orchestrator session reused" : "Orchestrator session created");
+      } catch (err) {
+        spinner.fail("Orchestrator setup failed");
+        if (dashboardProcess) {
+          dashboardProcess.kill();
+        }
+        throw new Error(
+          `Failed to setup orchestrator: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
     }
   }
 
@@ -609,7 +1102,12 @@ async function runStartup(
     console.log(chalk.cyan("Lifecycle:"), lifecycleTarget);
   }
 
-  if (opts?.orchestrator !== false && !reused) {
+  if (hasExistingOrchestrators) {
+    console.log(
+      chalk.cyan("Orchestrator:"),
+      "multiple sessions found — select one in the dashboard",
+    );
+  } else if (opts?.orchestrator !== false && !reused) {
     console.log(chalk.cyan("Orchestrator:"), `tmux attach -t ${tmuxTarget}`);
   } else if (reused) {
     console.log(chalk.cyan("Orchestrator:"), `reused existing session (${sessionId})`);
@@ -617,21 +1115,28 @@ async function runStartup(
 
   console.log(chalk.dim(`Config: ${config.configPath}`));
 
-  // Show next step hint
-  const projectIds = Object.keys(config.projects);
-  if (projectIds.length > 0) {
-    console.log(chalk.bold("\nNext step:\n"));
-    console.log(`  Spawn an agent session:`);
-    console.log(chalk.cyan(`     ao spawn <issue-number>\n`));
+  // Show next step hint (only if no existing orchestrators requiring selection)
+  if (!hasExistingOrchestrators) {
+    const projectIds = Object.keys(config.projects);
+    if (projectIds.length > 0) {
+      console.log(chalk.bold("\nNext step:\n"));
+      console.log(`  Spawn an agent session:`);
+      console.log(chalk.cyan(`     ao spawn <issue-number>\n`));
+    }
   }
 
-  // Auto-open browser to orchestrator session page once the server is accepting connections.
+  // Auto-open browser once the server is ready.
+  // With a single orchestrator (or a newly created one), navigate directly to the session page.
+  // With multiple existing orchestrators, open the selection page so the user can choose or
+  // spawn a new one — the dashboard only links one orchestrator per project.
   // Polls the port instead of using a fixed delay — deterministic and works regardless of
   // how long Next.js takes to compile. AbortController cancels polling on early exit.
   let openAbort: AbortController | undefined;
   if (opts?.dashboard !== false) {
     openAbort = new AbortController();
-    const orchestratorUrl = `http://localhost:${port}/sessions/${sessionId}`;
+    const orchestratorUrl = hasExistingOrchestrators
+      ? `http://localhost:${port}/orchestrators?project=${projectId}`
+      : `http://localhost:${port}/sessions/${selectedOrchestratorId ?? sessionId}`;
     void waitForPortAndOpen(port, orchestratorUrl, openAbort.signal);
   }
 
@@ -688,6 +1193,8 @@ export function registerStart(program: Command): void {
     .option("--no-dashboard", "Skip starting the dashboard server")
     .option("--no-orchestrator", "Skip starting the orchestrator agent")
     .option("--rebuild", "Clean and rebuild dashboard before starting")
+    .option("--dev", "Use Next.js dev server with hot reload (for dashboard UI development)")
+    .option("--interactive", "Prompt to configure config settings")
     .action(
       async (
         projectArg?: string,
@@ -695,6 +1202,8 @@ export function registerStart(program: Command): void {
           dashboard?: boolean;
           orchestrator?: boolean;
           rebuild?: boolean;
+          dev?: boolean;
+          interactive?: boolean;
         },
       ) => {
         try {
@@ -707,7 +1216,7 @@ export function registerStart(program: Command): void {
             console.log(chalk.bold.cyan("\n  Agent Orchestrator — Quick Start\n"));
             const result = await handleUrlStart(projectArg);
             config = result.config;
-            ({ projectId, project } = resolveProjectByRepo(config, result.parsed));
+            ({ projectId, project } = await resolveProjectByRepo(config, result.parsed));
           } else if (projectArg && isLocalPath(projectArg)) {
             // ── Path argument: add project if new, then start ──
             const resolvedPath = resolve(projectArg.replace(/^~/, process.env["HOME"] || ""));
@@ -730,7 +1239,7 @@ export function registerStart(program: Command): void {
                 projectId = addedId;
                 project = config.projects[projectId];
               } else {
-                ({ projectId, project } = resolveProject(config));
+                ({ projectId, project } = await resolveProject(config));
               }
             } else {
               config = loadConfig(configPath);
@@ -766,7 +1275,7 @@ export function registerStart(program: Command): void {
               }
             }
             config = loadedConfig;
-            ({ projectId, project } = resolveProject(config, projectArg));
+            ({ projectId, project } = await resolveProject(config, projectArg));
           }
 
           // ── Already-running detection (Step 9) ──
@@ -778,25 +1287,22 @@ export function registerStart(program: Command): void {
               console.log(`  PID: ${running.pid} | Up since: ${running.startedAt}`);
               console.log(`  Projects: ${running.projects.join(", ")}\n`);
 
-              // Interactive menu
-              const { createInterface } = await import("node:readline/promises");
-              const rl = createInterface({ input: process.stdin, output: process.stdout });
-              console.log("  1. Open dashboard (keep current)");
-              console.log("  2. Start new orchestrator on this project");
-              console.log("  3. Override — restart everything");
-              console.log("  4. Quit\n");
-              const choice = await rl.question("  Choice [1-4]: ");
-              rl.close();
+              const choice = await promptSelect(
+                "AO is already running. What do you want to do?",
+                [
+                  { value: "open", label: "Open dashboard", hint: "Keep the current instance" },
+                  { value: "new", label: "Start new orchestrator", hint: "Add a new session for this project" },
+                  { value: "restart", label: "Restart everything", hint: "Stop the current instance first" },
+                  { value: "quit", label: "Quit" },
+                ],
+                "open",
+              );
 
-              if (choice.trim() === "1") {
+              if (choice === "open") {
                 const url = `http://localhost:${running.port}`;
-                const [cmd, args]: [string, string[]] =
-                  process.platform === "win32"
-                    ? ["cmd.exe", ["/c", "start", "", url]]
-                    : [process.platform === "linux" ? "xdg-open" : "open", [url]];
-                spawn(cmd, args, { stdio: "ignore" });
+                openUrl(url);
                 process.exit(0);
-              } else if (choice.trim() === "2") {
+              } else if (choice === "new") {
                 // Generate unique orchestrator: same project, new session
                 const rawYaml = readFileSync(config.configPath, "utf-8");
                 const rawConfig = yamlParse(rawYaml);
@@ -826,7 +1332,7 @@ export function registerStart(program: Command): void {
                 projectId = newId;
                 project = config.projects[newId];
                 // Continue to startup below
-              } else if (choice.trim() === "3") {
+              } else if (choice === "restart") {
                 try { process.kill(running.pid, "SIGTERM"); } catch { /* already dead */ }
                 if (!(await waitForExit(running.pid, 5000))) {
                   console.log(chalk.yellow("  Process didn't exit cleanly, sending SIGKILL..."));
@@ -849,9 +1355,26 @@ export function registerStart(program: Command): void {
             }
           }
 
+          // ── Agent selection prompt (Step 10)──
+          const agentOverride = opts?.interactive ? await promptAgentSelection() : null;
+          if (agentOverride) {
+            const { orchestratorAgent, workerAgent } = agentOverride;
+
+            const rawYaml = readFileSync(config.configPath, "utf-8");
+            const rawConfig = yamlParse(rawYaml);
+            const proj = rawConfig.projects[projectId];
+            proj.orchestrator = { ...(proj.orchestrator ?? {}), agent: orchestratorAgent };
+            proj.worker = { ...(proj.worker ?? {}), agent: workerAgent };
+            writeFileSync(config.configPath, yamlStringify(rawConfig, { indent: 2 }));
+            console.log(chalk.dim(`  ✓ Saved to ${config.configPath}\n`));
+            
+            config = loadConfig(config.configPath);
+            project = config.projects[projectId];
+          }
+
           const actualPort = await runStartup(config, projectId, project, opts);
 
-          // ── Register in running.json (Step 10) ──
+          // ── Register in running.json (Step 11) ──
           await register({
             pid: process.pid,
             configPath: config.configPath,
@@ -883,13 +1406,12 @@ export function registerStop(program: Command): void {
   program
     .command("stop [project]")
     .description("Stop orchestrator agent and dashboard")
-    .option("--keep-session", "Keep mapped OpenCode session after stopping")
     .option("--purge-session", "Delete mapped OpenCode session when stopping")
     .option("--all", "Stop all running AO instances")
     .action(
       async (
         projectArg?: string,
-        opts: { keepSession?: boolean; purgeSession?: boolean; all?: boolean } = {},
+        opts: { purgeSession?: boolean; all?: boolean } = {},
       ) => {
         try {
           // Check running.json first
@@ -915,7 +1437,7 @@ export function registerStop(program: Command): void {
           }
 
           const config = loadConfig();
-          const { projectId: _projectId, project } = resolveProject(config, projectArg);
+          const { projectId: _projectId, project } = await resolveProject(config, projectArg, "stop");
           const sessionId = `${project.sessionPrefix}-orchestrator`;
           const port = config.port ?? 3000;
 
@@ -927,7 +1449,7 @@ export function registerStop(program: Command): void {
 
           if (existing) {
             const spinner = ora("Stopping orchestrator session").start();
-            const purgeOpenCode = opts.purgeSession === true ? true : opts.keepSession !== true;
+            const purgeOpenCode = opts?.purgeSession === true;
             await sm.kill(sessionId, { purgeOpenCode });
             spinner.succeed("Orchestrator session stopped");
           } else {
@@ -968,6 +1490,5 @@ export function registerStop(program: Command): void {
           }
           process.exit(1);
         }
-      },
-    );
+      });
 }

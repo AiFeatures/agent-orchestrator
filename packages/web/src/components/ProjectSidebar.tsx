@@ -15,12 +15,20 @@ interface ProjectSidebarProps {
   activeSessionId: string | undefined;
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  mobileOpen?: boolean;
+  onMobileClose?: () => void;
 }
 
 type ProjectHealth = "red" | "yellow" | "green" | "gray";
 
-function computeProjectHealth(sessions: DashboardSession[]): ProjectHealth {
-  const workers = sessions.filter((s) => !isOrchestratorSession(s));
+function computeProjectHealth(
+  sessions: DashboardSession[],
+  prefixByProject: Map<string, string>,
+  allPrefixes: string[],
+): ProjectHealth {
+  const workers = sessions.filter(
+    (s) => !isOrchestratorSession(s, prefixByProject.get(s.projectId), allPrefixes),
+  );
   if (workers.length === 0) return "gray";
   for (const s of workers) {
     if (getAttentionLevel(s) === "respond") return "red";
@@ -96,6 +104,8 @@ function ProjectSidebarInner({
   activeSessionId,
   collapsed = false,
   onToggleCollapsed,
+  mobileOpen = false,
+  onMobileClose,
 }: ProjectSidebarProps) {
   const router = useRouter();
   const pathname = usePathname();
@@ -127,6 +137,16 @@ function ProjectSidebarInner({
     router.push(pathname + `?project=${encodeURIComponent(projectId)}`);
   };
 
+  const prefixByProject = useMemo(
+    () => new Map(projects.map((p) => [p.id, p.sessionPrefix ?? p.id])),
+    [projects],
+  );
+
+  const allPrefixes = useMemo(
+    () => projects.map((p) => p.sessionPrefix ?? p.id),
+    [projects],
+  );
+
   const sessionsByProject = useMemo(() => {
     const map = new Map<string, { all: DashboardSession[]; workers: DashboardSession[] }>();
     let totalWorkers = 0;
@@ -140,7 +160,7 @@ function ProjectSidebarInner({
         map.set(s.projectId, entry);
       }
       entry.all.push(s);
-      if (!isOrchestratorSession(s)) {
+      if (!isOrchestratorSession(s, prefixByProject.get(s.projectId), allPrefixes)) {
         entry.workers.push(s);
         totalWorkers++;
       }
@@ -150,67 +170,76 @@ function ProjectSidebarInner({
     }
 
     return { map, totalWorkers, needsInput, reviewLoad };
-  }, [sessions]);
+  }, [sessions, prefixByProject, allPrefixes]);
 
   const { totalWorkers: totalWorkerSessions, needsInput: needsInputCount, reviewLoad: reviewLoadCount } = sessionsByProject;
 
   if (collapsed) {
     return (
-      <aside className="project-sidebar project-sidebar--collapsed flex h-full w-[56px] flex-col items-center py-3">
-        <div className="flex flex-1 flex-col items-center gap-2">
-          {projects.map((project) => {
-            const entry = sessionsByProject.map.get(project.id);
-            const health = entry ? computeProjectHealth(entry.all) : ("gray" as ProjectHealth);
-            const isActive = activeProjectId === project.id;
-            const initial = project.name.charAt(0).toUpperCase();
-            return (
-              <button
-                key={project.id}
-                type="button"
-                onClick={() => router.push(pathname + `?project=${encodeURIComponent(project.id)}`)}
-                className={cn(
-                  "project-sidebar__collapsed-project",
-                  isActive && "project-sidebar__collapsed-project--active",
-                )}
-                title={project.name}
-              >
-                <span className="project-sidebar__avatar">{initial}</span>
-                {health !== "gray" && (
-                  <span
-                    className={cn(
-                      "project-sidebar__health-indicator",
-                      health === "red" && "animate-[activity-pulse_2s_ease-in-out_infinite]",
-                    )}
-                    style={{ background: healthDotColor[health] }}
-                  />
-                )}
-              </button>
-            );
-          })}
-        </div>
-        <button
-          type="button"
-          onClick={onToggleCollapsed}
-          className="project-sidebar__collapsed-toggle mt-auto"
-          aria-label="Show project sidebar"
-        >
-          <svg
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            viewBox="0 0 24 24"
-            className="h-4 w-4"
+      <>
+        {mobileOpen && (
+          <div className="sidebar-mobile-backdrop" onClick={onMobileClose} />
+        )}
+        <aside className={cn("project-sidebar project-sidebar--collapsed flex h-full w-[56px] flex-col items-center py-3", mobileOpen && "project-sidebar--mobile-open")}>
+          <div className="flex flex-1 flex-col items-center gap-2">
+            {projects.map((project) => {
+              const entry = sessionsByProject.map.get(project.id);
+              const health = entry ? computeProjectHealth(entry.all, prefixByProject, allPrefixes) : ("gray" as ProjectHealth);
+              const isActive = activeProjectId === project.id;
+              const initial = project.name.charAt(0).toUpperCase();
+              return (
+                <button
+                  key={project.id}
+                  type="button"
+                  onClick={() => router.push(pathname + `?project=${encodeURIComponent(project.id)}`)}
+                  className={cn(
+                    "project-sidebar__collapsed-project",
+                    isActive && "project-sidebar__collapsed-project--active",
+                  )}
+                  title={project.name}
+                >
+                  <span className="project-sidebar__avatar">{initial}</span>
+                  {health !== "gray" && (
+                    <span
+                      className={cn(
+                        "project-sidebar__health-indicator",
+                        health === "red" && "animate-[activity-pulse_2s_ease-in-out_infinite]",
+                      )}
+                      style={{ background: healthDotColor[health] }}
+                    />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <button
+            type="button"
+            onClick={() => { onToggleCollapsed?.(); onMobileClose?.(); }}
+            className="project-sidebar__collapsed-toggle mt-auto"
+            aria-label="Show project sidebar"
           >
-            <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
-            <path d="M9 4.5v15M12 10l3 2-3 2" />
-          </svg>
-        </button>
-      </aside>
+            <svg
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              viewBox="0 0 24 24"
+              className="h-4 w-4"
+            >
+              <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+              <path d="M9 4.5v15M12 10l3 2-3 2" />
+            </svg>
+          </button>
+        </aside>
+      </>
     );
   }
 
   return (
-    <aside className="project-sidebar flex h-full w-[244px] flex-col">
+    <>
+      {mobileOpen && (
+        <div className="sidebar-mobile-backdrop" onClick={onMobileClose} />
+      )}
+      <aside className={cn("project-sidebar flex h-full w-[244px] flex-col", mobileOpen && "project-sidebar--mobile-open")}>
       <div className="project-sidebar__header px-4 pb-3 pt-4">
         <div className="project-sidebar__eyebrow">Portfolio</div>
         <div className="project-sidebar__title-row">
@@ -274,7 +303,7 @@ function ProjectSidebarInner({
           const entry = sessionsByProject.map.get(project.id);
           const projectSessions = entry?.all ?? [];
           const workerSessions = entry?.workers ?? [];
-          const health = computeProjectHealth(projectSessions);
+          const health = computeProjectHealth(projectSessions, prefixByProject, allPrefixes);
           const isExpanded = expandedProjects.has(project.id);
           const isActive = activeProjectId === project.id;
 
@@ -364,7 +393,7 @@ function ProjectSidebarInner({
         })}
       </nav>
       <div className="border-t border-[var(--color-border-subtle)] p-2">
-        <button type="button" onClick={onToggleCollapsed} className="project-sidebar__collapse-btn">
+        <button type="button" onClick={() => { onToggleCollapsed?.(); onMobileClose?.(); }} className="project-sidebar__collapse-btn">
           <svg
             fill="none"
             stroke="currentColor"
@@ -379,5 +408,6 @@ function ProjectSidebarInner({
         </button>
       </div>
     </aside>
+    </>
   );
 }
