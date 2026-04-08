@@ -9,27 +9,12 @@ import {
   listDashboardOrchestrators,
 } from "@/lib/serialize";
 import { getCorrelationId, jsonWithCorrelation, recordApiObservation } from "@/lib/observability";
-import { resolveGlobalPause } from "@/lib/global-pause";
 import { filterProjectSessions } from "@/lib/project-utils";
+import { settlesWithin } from "@/lib/async-utils";
 
 const METADATA_ENRICH_TIMEOUT_MS = 3_000;
 const PR_ENRICH_TIMEOUT_MS = 4_000;
 const PER_PR_ENRICH_TIMEOUT_MS = 1_500;
-
-async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
-  let timeoutId: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<boolean>((resolve) => {
-    timeoutId = setTimeout(() => resolve(false), timeoutMs);
-  });
-
-  try {
-    return await Promise.race([promise.then(() => true).catch(() => true), timeoutPromise]);
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-  }
-}
 
 export async function GET(request: Request) {
   const correlationId = getCorrelationId(request);
@@ -38,6 +23,7 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const projectFilter = searchParams.get("project");
     const activeOnly = searchParams.get("active") === "true";
+    const orchestratorOnly = searchParams.get("orchestratorOnly") === "true";
 
     const { config, registry, sessionManager } = await getServices();
     const requestedProjectId =
@@ -45,12 +31,44 @@ export async function GET(request: Request) {
         ? projectFilter
         : undefined;
     const coreSessions = await sessionManager.list(requestedProjectId);
-    const allSessions = requestedProjectId ? await sessionManager.list() : coreSessions;
     const visibleSessions = filterProjectSessions(coreSessions, projectFilter, config.projects);
     const orchestrators = listDashboardOrchestrators(visibleSessions, config.projects);
     const orchestratorId = orchestrators.length === 1 ? (orchestrators[0]?.id ?? null) : null;
 
-    let workerSessions = visibleSessions.filter((session) => !isOrchestratorSession(session));
+    if (orchestratorOnly) {
+      recordApiObservation({
+        config,
+        method: "GET",
+        path: "/api/sessions",
+        correlationId,
+        startedAt,
+        outcome: "success",
+        statusCode: 200,
+        data: { orchestratorOnly: true, orchestratorCount: orchestrators.length },
+      });
+
+      return jsonWithCorrelation(
+        {
+          orchestratorId,
+          orchestrators,
+          sessions: [],
+        },
+        { status: 200 },
+        correlationId,
+      );
+    }
+
+    const allSessionPrefixes = Object.entries(config.projects).map(
+      ([projectId, p]) => p.sessionPrefix ?? projectId,
+    );
+    let workerSessions = visibleSessions.filter(
+      (session) =>
+        !isOrchestratorSession(
+          session,
+          config.projects[session.projectId]?.sessionPrefix ?? session.projectId,
+          allSessionPrefixes,
+        ),
+    );
 
     // Convert to dashboard format
     let dashboardSessions = workerSessions.map(sessionToDashboard);
@@ -69,22 +87,26 @@ export async function GET(request: Request) {
     );
 
     if (metadataSettled) {
-      const prDeadlineAt = Date.now() + PR_ENRICH_TIMEOUT_MS;
+      const prEnrichPromises: Promise<boolean>[] = [];
+
       for (let i = 0; i < workerSessions.length; i++) {
         const core = workerSessions[i];
         if (!core?.pr) continue;
-
-        const remainingMs = prDeadlineAt - Date.now();
-        if (remainingMs <= 0) break;
 
         const project = resolveProject(core, config.projects);
         const scm = getSCM(registry, project);
         if (!scm) continue;
 
-        await settlesWithin(
-          enrichSessionPR(dashboardSessions[i], scm, core.pr),
-          Math.min(remainingMs, PER_PR_ENRICH_TIMEOUT_MS),
+        prEnrichPromises.push(
+          settlesWithin(
+            enrichSessionPR(dashboardSessions[i], scm, core.pr),
+            PER_PR_ENRICH_TIMEOUT_MS,
+          ),
         );
+      }
+
+      if (prEnrichPromises.length > 0) {
+        await settlesWithin(Promise.allSettled(prEnrichPromises), PR_ENRICH_TIMEOUT_MS);
       }
     }
 
@@ -105,7 +127,6 @@ export async function GET(request: Request) {
         stats: computeStats(dashboardSessions),
         orchestratorId,
         orchestrators,
-        globalPause: resolveGlobalPause(allSessions),
       },
       { status: 200 },
       correlationId,

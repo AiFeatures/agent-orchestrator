@@ -19,7 +19,13 @@ export {
 } from "./config.js";
 
 // Plugin registry
-export { createPluginRegistry } from "./plugin-registry.js";
+export {
+  createPluginRegistry,
+  isPluginModule,
+  normalizeImportedPluginModule,
+  resolveLocalPluginEntrypoint,
+  resolvePackageExportsEntry,
+} from "./plugin-registry.js";
 
 // Metadata — flat-file session metadata read/write
 export {
@@ -78,15 +84,6 @@ export type {
 export { generateOrchestratorPrompt } from "./orchestrator-prompt.js";
 export type { OrchestratorPromptConfig } from "./orchestrator-prompt.js";
 
-
-// Global pause constants and utilities
-export {
-  GLOBAL_PAUSE_UNTIL_KEY,
-  GLOBAL_PAUSE_REASON_KEY,
-  GLOBAL_PAUSE_SOURCE_KEY,
-  parsePauseUntil,
-} from "./global-pause.js";
-
 // Shared utilities
 export {
   shellEscape,
@@ -105,6 +102,23 @@ export {
 } from "./scm-webhook-utils.js";
 export { asValidOpenCodeSessionId } from "./opencode-session-id.js";
 export { normalizeOrchestratorSessionStrategy } from "./orchestrator-session-strategy.js";
+
+// Activity log — JSONL activity tracking for agents without native JSONL
+export {
+  appendActivityEntry,
+  readLastActivityEntry,
+  checkActivityLogState,
+  getActivityFallbackState,
+  classifyTerminalActivity,
+  recordTerminalActivity,
+} from "./activity-log.js";
+
+// Agent workspace hooks — shared PATH-wrapper setup for non-Claude agents
+export {
+  setupPathWrapperWorkspace,
+  buildAgentPath,
+  PREFERRED_GH_PATH,
+} from "./agent-workspace-hooks.js";
 export type { NormalizedOrchestratorSessionStrategy } from "./orchestrator-session-strategy.js";
 
 export {
@@ -115,6 +129,7 @@ export {
 export type {
   ObservabilityMetricName,
   ObservabilityHealthStatus,
+  ObservabilityLevel,
   ObservabilitySummary,
   ProjectObserver,
 } from "./observability.js";

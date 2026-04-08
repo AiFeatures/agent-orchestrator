@@ -1,5 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  serverExternalPackages: ["@composio/core"],
   transpilePackages: [
     "@composio/ao-core",
     "@composio/ao-plugin-agent-claude-code",
@@ -10,6 +11,24 @@ const nextConfig = {
     "@composio/ao-plugin-tracker-linear",
     "@composio/ao-plugin-workspace-worktree",
   ],
+  async headers() {
+    return [
+      {
+        source: "/sw.js",
+        headers: [
+          { key: "Cache-Control", value: "no-cache, no-store, must-revalidate" },
+          { key: "Service-Worker-Allowed", value: "/" },
+        ],
+      },
+    ];
+  },
 };
 
-export default nextConfig;
+// Only load bundle analyzer when ANALYZE=true (dev-only dependency)
+let config = nextConfig;
+if (process.env.ANALYZE === "true") {
+  const { default: bundleAnalyzer } = await import("@next/bundle-analyzer");
+  config = bundleAnalyzer({ enabled: true })(nextConfig);
+}
+
+export default config;

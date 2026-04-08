@@ -1,24 +1,50 @@
 "use client";
 
 import { useEffect, useReducer, useRef } from "react";
-import type { DashboardSession, GlobalPauseState, SSESnapshotEvent } from "@/lib/types";
+import {
+  getAttentionLevel,
+  type AttentionLevel,
+  type DashboardSession,
+  type SSESnapshotEvent,
+} from "@/lib/types";
 
+/** Debounce before fetching full session list after membership change. */
 const MEMBERSHIP_REFRESH_DELAY_MS = 120;
+/** Re-fetch full session list if no refresh has happened in this interval. */
 const STALE_REFRESH_INTERVAL_MS = 15000;
+/** Grace period before declaring "disconnected" (allows for transient reconnects). */
+const DISCONNECTED_GRACE_PERIOD_MS = 4000;
+
+type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
+
+/** Server-computed attention levels from the latest SSE snapshot. */
+export type SSEAttentionMap = Readonly<Record<string, AttentionLevel>>;
+
 
 interface State {
   sessions: DashboardSession[];
-  globalPause: GlobalPauseState | null;
+  connectionStatus: ConnectionStatus;
+  /** Attention levels from the latest SSE snapshot (server-computed, includes PR state). */
+  sseAttentionLevels: SSEAttentionMap;
 }
 
 type Action =
-  | { type: "reset"; sessions: DashboardSession[]; globalPause: GlobalPauseState | null }
-  | { type: "snapshot"; patches: SSESnapshotEvent["sessions"] };
+  | { type: "reset"; sessions: DashboardSession[]; sseAttentionLevels?: SSEAttentionMap }
+  | { type: "snapshot"; patches: SSESnapshotEvent["sessions"] }
+  | { type: "setConnection"; status: ConnectionStatus };
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
     case "reset":
-      return { sessions: action.sessions, globalPause: action.globalPause };
+      return {
+        ...state,
+        sessions: action.sessions,
+        ...(action.sseAttentionLevels !== undefined
+          ? { sseAttentionLevels: action.sseAttentionLevels }
+          : {}),
+      };
+    case "setConnection":
+      return { ...state, connectionStatus: action.status };
     case "snapshot": {
       const patchMap = new Map(action.patches.map((p) => [p.id, p]));
       let changed = false;
@@ -33,14 +59,27 @@ function reducer(state: State, action: Action): State {
           return s;
         }
         changed = true;
-        return {
-          ...s,
-          status: patch.status,
-          activity: patch.activity,
-          lastActivityAt: patch.lastActivityAt,
-        };
+        return { ...s, status: patch.status, activity: patch.activity, lastActivityAt: patch.lastActivityAt };
       });
-      return changed ? { ...state, sessions: next } : state;
+
+      // Build attention level map from server-computed values
+      const levels: Record<string, AttentionLevel> = {};
+      for (const p of action.patches) {
+        levels[p.id] = p.attentionLevel;
+      }
+
+      const sessionsChanged = changed;
+      const levelsChanged =
+        Object.keys(levels).length !== Object.keys(state.sseAttentionLevels).length ||
+        action.patches.some((p) => state.sseAttentionLevels[p.id] !== p.attentionLevel);
+
+      if (!sessionsChanged && !levelsChanged) return state;
+
+      return {
+        ...state,
+        sessions: sessionsChanged ? next : state.sessions,
+        sseAttentionLevels: levelsChanged ? levels : state.sseAttentionLevels,
+      };
     }
   }
 }
@@ -56,28 +95,40 @@ function createMembershipKey(
 
 export function useSessionEvents(
   initialSessions: DashboardSession[],
-  initialGlobalPause?: GlobalPauseState | null,
   project?: string,
+  initialAttentionLevels?: SSEAttentionMap,
 ): State {
   const [state, dispatch] = useReducer(reducer, {
     sessions: initialSessions,
-    globalPause: initialGlobalPause ?? null,
+    connectionStatus: "connected" as ConnectionStatus,
+    sseAttentionLevels: initialAttentionLevels ?? ({} as SSEAttentionMap),
   });
   const sessionsRef = useRef(state.sessions);
+  const initialAttentionLevelsRef = useRef(initialAttentionLevels);
+  initialAttentionLevelsRef.current = initialAttentionLevels;
   const refreshingRef = useRef(false);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingMembershipKeyRef = useRef<string | null>(null);
-  const lastRefreshAtRef = useRef(Date.now());
+  const lastRefreshAtRef = useRef(0);
+  const disconnectedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Reset state when server-rendered props change (e.g. full page refresh)
   useEffect(() => {
     sessionsRef.current = state.sessions;
   }, [state.sessions]);
 
   useEffect(() => {
-    dispatch({ type: "reset", sessions: initialSessions, globalPause: initialGlobalPause ?? null });
-  }, [initialSessions, initialGlobalPause]);
+    dispatch({
+      type: "reset",
+      sessions: initialSessions,
+      sseAttentionLevels: initialAttentionLevelsRef.current ?? ({} as SSEAttentionMap),
+    });
+  }, [initialSessions]);
 
   useEffect(() => {
+    // Reset so the new project gets an immediate first refresh on its first SSE snapshot
+    lastRefreshAtRef.current = 0;
+
     const url = project ? `/api/events?project=${encodeURIComponent(project)}` : "/api/events";
     const es = new EventSource(url);
     let disposed = false;
@@ -87,6 +138,13 @@ export function useSessionEvents(
       if (refreshTimerRef.current) {
         clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = null;
+      }
+    };
+
+    const clearDisconnectedTimer = () => {
+      if (disconnectedTimerRef.current) {
+        clearTimeout(disconnectedTimerRef.current);
+        disconnectedTimerRef.current = null;
       }
     };
 
@@ -108,18 +166,32 @@ export function useSessionEvents(
         void fetch(sessionsUrl, { signal: refreshController.signal })
           .then((res) => (res.ok ? res.json() : null))
           .then(
-            (updated: { sessions?: DashboardSession[]; globalPause?: GlobalPauseState } | null) => {
-              if (disposed || refreshController.signal.aborted || !updated?.sessions) return;
+            (updated: { sessions?: DashboardSession[] } | null) => {
+              if (disposed || refreshController.signal.aborted || !updated?.sessions) {
+                // Update timestamp even for non-OK responses to prevent retry storms
+                if (!disposed && !refreshController.signal.aborted) {
+                  lastRefreshAtRef.current = Date.now();
+                }
+                return;
+              }
 
               lastRefreshAtRef.current = Date.now();
+              const sseAttentionLevels = Object.fromEntries(
+                updated.sessions.map((s) => [s.id, getAttentionLevel(s)]),
+              ) as SSEAttentionMap;
               dispatch({
                 type: "reset",
                 sessions: updated.sessions,
-                globalPause: updated.globalPause ?? null,
+                sseAttentionLevels,
               });
             },
           )
-          .catch(() => undefined)
+          .catch((err: unknown) => {
+            if (err instanceof DOMException && err.name === "AbortError") return;
+            console.warn("[useSessionEvents] refresh failed:", err);
+            // Update timestamp on failure to prevent retry loops on every SSE snapshot
+            lastRefreshAtRef.current = Date.now();
+          })
           .finally(() => {
             if (activeRefreshController === refreshController) {
               activeRefreshController = null;
@@ -169,7 +241,31 @@ export function useSessionEvents(
       }
     };
 
-    es.onerror = () => undefined;
+    es.onopen = () => {
+      clearDisconnectedTimer();
+      if (!disposed) dispatch({ type: "setConnection", status: "connected" });
+    };
+
+    es.onerror = () => {
+      if (disposed) return;
+
+      if (es.readyState === EventSource.CLOSED) {
+        clearDisconnectedTimer();
+        dispatch({ type: "setConnection", status: "disconnected" });
+        return;
+      }
+
+      dispatch({ type: "setConnection", status: "reconnecting" });
+
+      if (disconnectedTimerRef.current === null) {
+        disconnectedTimerRef.current = setTimeout(() => {
+          disconnectedTimerRef.current = null;
+          if (!disposed && es.readyState !== EventSource.OPEN) {
+            dispatch({ type: "setConnection", status: "disconnected" });
+          }
+        }, DISCONNECTED_GRACE_PERIOD_MS);
+      }
+    };
 
     return () => {
       disposed = true;
@@ -178,6 +274,7 @@ export function useSessionEvents(
       refreshingRef.current = false;
       pendingMembershipKeyRef.current = null;
       clearRefreshTimer();
+      clearDisconnectedTimer();
       es.close();
     };
   }, [project]);

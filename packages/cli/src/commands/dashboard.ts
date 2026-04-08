@@ -1,9 +1,16 @@
 import { spawn } from "node:child_process";
+import { resolve } from "node:path";
 import chalk from "chalk";
 import type { Command } from "commander";
 import { loadConfig } from "@composio/ao-core";
 import { findWebDir, buildDashboardEnv, waitForPortAndOpen } from "../lib/web-dir.js";
-import { cleanNextCache, findRunningDashboardPid, findProcessWebDir, waitForPortFree } from "../lib/dashboard-rebuild.js";
+import {
+  findRunningDashboardPid,
+  isInstalledUnderNodeModules,
+  rebuildDashboardProductionArtifacts,
+  waitForPortFree,
+} from "../lib/dashboard-rebuild.js";
+import { preflight } from "../lib/preflight.js";
 
 export function registerDashboard(program: Command): void {
   program
@@ -12,6 +19,7 @@ export function registerDashboard(program: Command): void {
     .option("-p, --port <port>", "Port to listen on")
     .option("--no-open", "Don't open browser automatically")
     .option("--rebuild", "Clean stale build artifacts and rebuild before starting")
+    /* c8 ignore start -- process-spawning startup code, tested via integration/onboarding */
     .action(async (opts: { port?: string; open?: boolean; rebuild?: boolean }) => {
       const config = loadConfig();
       const port = opts.port ? parseInt(opts.port, 10) : (config.port ?? 3000);
@@ -26,11 +34,9 @@ export function registerDashboard(program: Command): void {
       if (opts.rebuild) {
         // Check if a dashboard is already running on this port.
         const runningPid = await findRunningDashboardPid(port);
-        const runningWebDir = runningPid ? await findProcessWebDir(runningPid) : null;
-        const targetWebDir = runningWebDir ?? localWebDir;
 
         if (runningPid) {
-          // Kill the running server, clean .next, then start fresh below.
+          // Stop the running server before rebuilding or restarting below.
           console.log(
             chalk.dim(`Stopping dashboard (PID ${runningPid}) on port ${port}...`),
           );
@@ -43,8 +49,10 @@ export function registerDashboard(program: Command): void {
           await waitForPortFree(port, 5000);
         }
 
-        await cleanNextCache(targetWebDir);
+        await rebuildDashboardProductionArtifacts(localWebDir);
         // Fall through to start the dashboard on this port.
+      } else {
+        await preflight.checkBuilt(localWebDir);
       }
 
       const webDir = localWebDir;
@@ -58,7 +66,8 @@ export function registerDashboard(program: Command): void {
         config.directTerminalPort,
       );
 
-      const child = spawn("npx", ["next", "dev", "-p", String(port)], {
+      const startScript = resolve(webDir, "dist-server", "start-all.js");
+      const child = spawn("node", [startScript], {
         cwd: webDir,
         stdio: ["inherit", "inherit", "pipe"],
         env,
@@ -96,10 +105,13 @@ export function registerDashboard(program: Command): void {
         if (code !== 0 && code !== null && !opts.rebuild) {
           const stderr = stderrChunks.join("");
           if (looksLikeStaleBuild(stderr)) {
+            const recoveryCommand = isInstalledUnderNodeModules(webDir)
+              ? "npm install -g @composio/ao@latest"
+              : "ao dashboard --rebuild";
             console.error(
               chalk.yellow(
                 "\nThis looks like a stale build cache issue. Try:\n\n" +
-                  `  ${chalk.cyan("ao dashboard --rebuild")}\n`,
+                  `  ${chalk.cyan(recoveryCommand)}\n`,
               ),
             );
           }
@@ -108,6 +120,7 @@ export function registerDashboard(program: Command): void {
         process.exit(code ?? 0);
       });
     });
+    /* c8 ignore stop */
 }
 
 /**
