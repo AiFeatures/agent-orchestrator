@@ -1,49 +1,30 @@
-# AI Agent Instructions
+# AGENTS.md
 
-## Repository: agent-orchestrator
+> Full project context, architecture, conventions, and plugin standards are in **CLAUDE.md**.
 
-- **Organization**: AiFeatures
-- **Enterprise**: iAiFy
+## Commands
 
-## Shared Infrastructure
+```bash
+pnpm install                            # Install dependencies
+pnpm build                              # Build all packages
+pnpm dev                                # Web dashboard dev server (Next.js + 2 WS servers)
+pnpm typecheck                          # Type check all packages
+pnpm test                               # All tests (excludes web)
+pnpm --filter @aoagents/ao-web test     # Web tests
+pnpm lint                               # ESLint check
+pnpm lint:fix                           # ESLint fix
+pnpm format                             # Prettier format
+```
 
-| Resource | Reference |
-|---|---|
-| Reusable workflows | `Ai-road-4-You/enterprise-ci-cd@v1` |
-| Composite actions | `Ai-road-4-You/github-actions@v1` |
-| Governance docs | `Ai-road-4-You/governance` |
-| Repo templates | `Ai-road-4-You/repo-templates` |
+## Architecture TL;DR
 
-## Conventions
+Monorepo (pnpm) with packages: `core`, `cli`, `web`, and `plugins/*`. The web dashboard is a Next.js 15 app (App Router) with React 19 and Tailwind CSS v4. Data flows from `agent-orchestrator.yaml` through core's `loadConfig()` to API routes, served via SSR and a 5s-interval SSE stream. Terminal sessions use WebSocket connections to tmux PTYs. See CLAUDE.md for the full plugin architecture (8 slots), session lifecycle, and data flow.
 
-1. Use **conventional commits** (`feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`)
-2. Create **feature branches** for all changes
-3. Never push directly to `main`
-4. Run tests before submitting PR
-5. Keep dependencies updated via Dependabot
-6. All file names in **kebab-case**
+## Key Files
 
-## Quality Gates
-
-Before merging any PR:
-
-- [ ] Lint passes
-- [ ] Tests pass (if test suite exists)
-- [ ] No new security vulnerabilities
-- [ ] PR has meaningful description
-- [ ] Conventional commit messages used
-
-## Branch Strategy
-
-- `main` — Production-ready, protected
-- `feature/*` — New features
-- `fix/*` — Bug fixes
-- `chore/*` — Maintenance
-
-## Agent Guardrails
-
-- Maximum autonomous change: single file or single PR
-- No force pushes
-- No branch deletion without approval
-- No secrets in code or commits
-- All agent changes must be traceable via commit author
+- `packages/core/src/types.ts` — All plugin interfaces (Agent, Runtime, Workspace, etc.)
+- `packages/core/src/session-manager.ts` — Session CRUD
+- `packages/core/src/lifecycle-manager.ts` — State machine + polling loop
+- `packages/web/src/components/Dashboard.tsx` — Main dashboard view
+- `packages/web/src/components/SessionDetail.tsx` — Session detail view
+- `packages/web/src/app/globals.css` — Design tokens

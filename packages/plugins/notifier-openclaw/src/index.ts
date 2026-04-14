@@ -9,8 +9,27 @@ import {
   type OrchestratorEvent,
   type PluginModule,
   getObservabilityBaseDir,
-} from "@composio/ao-core";
-import { isRetryableHttpStatus, normalizeRetryConfig, validateUrl } from "@composio/ao-core/utils";
+} from "@aoagents/ao-core";
+import { isRetryableHttpStatus, normalizeRetryConfig, validateUrl } from "@aoagents/ao-core/utils";
+
+/**
+ * Read the hooks token from ~/.openclaw/openclaw.json as a fallback for
+ * daemon contexts where the shell profile (and OPENCLAW_HOOKS_TOKEN) isn't
+ * sourced. This file is written by `ao setup openclaw` and lives outside
+ * the project directory so it's never committed to version control.
+ */
+function readTokenFromOpenClawConfig(): string | undefined {
+  try {
+    const configPath = join(homedir(), ".openclaw", "openclaw.json");
+    if (!existsSync(configPath)) return undefined;
+    const raw = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(raw) as Record<string, unknown>;
+    const token = (config.hooks as Record<string, unknown> | undefined)?.token;
+    return typeof token === "string" && token ? token : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Read the hooks token from ~/.openclaw/openclaw.json as a fallback for

@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Session, RuntimeHandle, AgentLaunchConfig } from "@composio/ao-core";
+import type { Session, RuntimeHandle, AgentLaunchConfig } from "@aoagents/ao-core";
+
+const { mockAppendActivityEntry, mockReadLastActivityEntry, mockRecordTerminalActivity } =
+  vi.hoisted(() => ({
+    mockAppendActivityEntry: vi.fn().mockResolvedValue(undefined),
+    mockReadLastActivityEntry: vi.fn().mockResolvedValue(null),
+    mockRecordTerminalActivity: vi.fn().mockResolvedValue(undefined),
+  }));
 
 const { mockAppendActivityEntry, mockReadLastActivityEntry, mockRecordTerminalActivity } =
   vi.hoisted(() => ({
@@ -10,7 +17,7 @@ const { mockAppendActivityEntry, mockReadLastActivityEntry, mockRecordTerminalAc
 
 const mockExecFileAsync = vi.fn();
 
-vi.mock("@composio/ao-core", async (importOriginal) => {
+vi.mock("@aoagents/ao-core", async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
