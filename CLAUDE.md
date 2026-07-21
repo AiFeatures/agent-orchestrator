@@ -1,30 +1,44 @@
 # agent-orchestrator — Claude Code Context
 
-Read and follow [`AGENTS.md`](AGENTS.md) for repository layout, commands, coding conventions, and hard rules.
+## Overview
 
-## App state lives under `~/.ao` only
+- **Repository**: AiFeatures/agent-orchestrator
+- **Enterprise**: iAiFy
+- **Language**: TypeScript
+- **Description**:  Agentic orchestrator for parallel coding agents — plans tasks, spawns agents, and autonomously handles CI    fixes, merge conflicts, and code reviews.
 
-All app state, the daemon's data dir, `running.json`, worktrees, and the Electron
-supervisor's `userData` (Chromium cache, cookies, local/session storage, crash
-dumps), must resolve under `~/.ao` (overridable via `AO_DATA_DIR`/`AO_RUN_FILE`).
-Never write to or read from `~/Library/Application Support` or any other OS-default
-app-data location. `frontend/src/main.ts` pins Electron's `userData` to
-`~/.ao/electron`; do not remove that override. See the hard rule in `AGENTS.md`.
+## Fork Notes
 
-## Design System
+This is a fork maintained under iAiFy enterprise.
+- Do NOT create PRs back to upstream
+- Local changes live on the main branch
+- Upstream sync managed by Ai-road-4-You/fork-sync
 
-Always read [`DESIGN.md`](DESIGN.md) before making any visual or UI decision —
-**start with the "clone agent-orchestrator verbatim" banner at the top**, which
-governs the current look.
+## Quick Start
 
-The renderer **clones the agent-orchestrator web app verbatim**
-(`~/Projects/agent-orchestrator/packages/web/src`) in looks and design, with a
-refined-blue accent and the terminal keeping its own palette. This **supersedes the
-older "match emdash" framing** in DESIGN.md (per explicit user decision 2026-06-10).
-Build new UI from shadcn primitives (`components/ui/*`) where a component fits. Do not
-deviate without explicit user approval. In QA/review, flag any renderer code that
-diverges from **agent-orchestrator** — do **not** re-flag emdash mismatches.
+```bash
+npm ci && npm test
+```
 
-When showing or demoing frontend changes, run `ao preview [url]` from inside the
-session so the change renders in the desktop browser panel (the inspector rail's
-Browser tab); do not just describe it.
+## Conventions
+
+- Conventional commits: feat:, fix:, chore:, docs:
+- Kebab-case file names
+- Branch protection on main — PRs required
+- CODEOWNERS: @AiFeatures/ai-engineering
+
+## Shared Resources
+
+| Asset | Location |
+|---|---|
+| CI/CD workflows | Ai-road-4-You/enterprise-ci-cd@v1 |
+| Composite actions | Ai-road-4-You/github-actions@v1 |
+| Governance | Ai-road-4-You/governance |
+| Templates | Ai-road-4-You/repo-templates |
+
+## AgentHub
+- Central hub: `~/AgentHub/`
+- Skills: `.agents/skills/` (symlinked to AgentHub shared skills)
+- MCP: 12 servers synced across all agents
+- Agents: 14 shared agents available
+- Hooks: Safety, notification, and logging hooks
