@@ -1,31 +1,18 @@
 {
-  "name": "@aoagents/ao",
-  "version": "0.2.5",
-  "description": "Orchestrate parallel AI coding agents — global CLI wrapper",
-  "license": "MIT",
-  "type": "module",
-  "bin": {
-    "ao": "bin/ao.js"
-  },
-  "scripts": {
-    "postinstall": "node bin/postinstall.js"
-  },
-  "files": [
-    "bin"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/ComposioHQ/agent-orchestrator.git",
-    "directory": "packages/ao"
-  },
-  "homepage": "https://github.com/ComposioHQ/agent-orchestrator",
-  "bugs": {
-    "url": "https://github.com/ComposioHQ/agent-orchestrator/issues"
-  },
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "dependencies": {
-    "@aoagents/ao-cli": "workspace:*"
-  }
+	"name": "@aoagents/ao",
+	"version": "0.10.0",
+	"description": "Agent Orchestrator CLI. Resolves and runs the prebuilt Go binary for your platform.",
+	"license": "MIT",
+	"bin": {
+		"ao": "./bin/ao.js"
+	},
+	"files": [
+		"bin/"
+	],
+	"optionalDependencies": {
+		"@aoagents/ao-darwin-arm64": "0.10.0",
+		"@aoagents/ao-darwin-x64": "0.10.0",
+		"@aoagents/ao-linux-x64": "0.10.0",
+		"@aoagents/ao-win32-x64": "0.10.0"
+	}
 }
