@@ -73,6 +73,8 @@ func Build() ([]byte, error) {
 			"Server-sent CDC event stream with durable replay"),
 		*(&openapi31.Tag{Name: "import"}).WithDescription(
 			"Legacy AO project import (availability probe and run)"),
+		*(&openapi31.Tag{Name: "dev"}).WithDescription(
+			"Developer-only maintenance operations"),
 		*(&openapi31.Tag{Name: "mobile"}).WithDescription(
 			"Connect Mobile LAN bridge control (loopback/desktop only)"),
 	}
@@ -148,12 +150,16 @@ var schemaNames = map[string]string{
 	"ControllersCleanupSessionsQuery":             "CleanupSessionsQuery",
 	"ControllersListSessionsResponse":             "ListSessionsResponse",
 	"ControllersSpawnSessionRequest":              "SpawnSessionRequest",
+	"ControllersSpawnSessionResponse":             "SpawnSessionResponse",
 	"ControllersSessionResponse":                  "SessionResponse",
 	"ControllersSessionPreviewResponse":           "SessionPreviewResponse",
 	"ControllersSetSessionPreviewRequest":         "SetSessionPreviewRequest",
+	"ControllersSetSessionMergePolicyRequest":     "SetSessionMergePolicyRequest",
+	"ControllersSetSessionMergePolicyResponse":    "SetSessionMergePolicyResponse",
 	"ControllersRenameSessionRequest":             "RenameSessionRequest",
 	"ControllersRenameSessionResponse":            "RenameSessionResponse",
 	"ControllersRestoreSessionResponse":           "RestoreSessionResponse",
+	"ControllersResumeAgentResponse":              "ResumeAgentResponse",
 	"ControllersCleanupSessionsResponse":          "CleanupSessionsResponse",
 	"ControllersCleanupSkippedSession":            "CleanupSkippedSession",
 	"ControllersWorkspaceFileQuery":               "WorkspaceFileQuery",
@@ -171,6 +177,7 @@ var schemaNames = map[string]string{
 	"ControllersSessionPRCISummary":               "SessionPRCISummary",
 	"ControllersSessionPRFailingCheck":            "SessionPRFailingCheck",
 	"ControllersSessionPRReviewSummary":           "SessionPRReviewSummary",
+	"ControllersSessionPRReviewEntry":             "SessionPRReviewEntry",
 	"ControllersSessionPRUnresolvedReviewer":      "SessionPRUnresolvedReviewer",
 	"ControllersSessionPRReviewCommentLink":       "SessionPRReviewCommentLink",
 	"ControllersSessionPRMergeabilitySummary":     "SessionPRMergeabilitySummary",
@@ -193,6 +200,12 @@ var schemaNames = map[string]string{
 	"ControllersMarkNotificationReadRequest":      "MarkNotificationReadRequest",
 	"ControllersNotificationEnvelope":             "NotificationEnvelope",
 	"ControllersMarkAllNotificationsReadResponse": "MarkAllNotificationsReadResponse",
+	// httpd/controllers — standalone shell terminal wire envelopes
+	"ControllersShellTerminalHandleIDParam": "ShellTerminalHandleIDParam",
+	"ControllersOpenShellTerminalRequest":   "OpenShellTerminalRequest",
+	"ControllersShellTerminalResponse":      "ShellTerminalResponse",
+	"ControllersListShellTerminalsResponse": "ListShellTerminalsResponse",
+	"ControllersShellTerminalEnvelope":      "ShellTerminalEnvelope",
 	// httpd/controllers — PR wire envelopes
 	"ControllersMergePRResponse":         "MergePRResponse",
 	"ControllersResolveCommentsRequest":  "ResolveCommentsRequest",
@@ -210,8 +223,14 @@ var schemaNames = map[string]string{
 	// httpd/controllers: import wire envelopes
 	"ControllersImportStatusResponse": "ImportStatusResponse",
 	"ControllersImportRunResponse":    "ImportRunResponse",
+	// httpd/controllers: dev wire envelopes
+	"ControllersDevImportProjectsRequest":  "DevImportProjectsRequest",
+	"ControllersDevImportProjectsResponse": "DevImportProjectsResponse",
 	// httpd/controllers: mobile wire envelopes
 	"ControllersMobileStatusResponse": "MobileStatusResponse",
+	// devimport report
+	"DevimportReport":   "DevImportProjectsReport",
+	"DevimportConflict": "DevImportProjectsConflict",
 	// httpd/controllers: push-device wire envelopes
 	"ControllersRegisterPushDeviceRequest":    "RegisterPushDeviceRequest",
 	"ControllersPushDeviceEnvelope":           "PushDeviceEnvelope",
@@ -228,6 +247,7 @@ var schemaNames = map[string]string{
 	"ProjectInitializeRepositoryResult": "InitializeRepositoryResult",
 	"ProjectRemoveResult":               "RemoveProjectResult",
 	"ProjectSetConfigInput":             "SetProjectConfigInput",
+	"ProjectUpdateSettingsInput":        "UpdateProjectSettingsInput",
 	"ProjectWorkspaceRepo":              "WorkspaceRepo",
 	"SessionWorkspaceFileStatus":        "WorkspaceFileStatus",
 }
@@ -312,8 +332,50 @@ func operations() []operation {
 	ops = append(ops, notificationOperations()...)
 	ops = append(ops, pushOperations()...)
 	ops = append(ops, importOperations()...)
+	ops = append(ops, devOperations()...)
 	ops = append(ops, mobileOperations()...)
+	ops = append(ops, shellTerminalOperations()...)
 	return ops
+}
+
+// shellTerminalOperations describes the standalone shell terminal surface:
+// shells the user opens by hand, with no agent session behind them.
+func shellTerminalOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodGet, path: "/api/v1/shell-terminals", id: "listShellTerminals", tag: "shellTerminals",
+			summary: "List the standalone shell terminals owned by the current app run",
+			resps: []respUnit{
+				{http.StatusOK, controllers.ListShellTerminalsResponse{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/shell-terminals", id: "openShellTerminal", tag: "shellTerminals",
+			summary: "Open a standalone shell terminal",
+			reqBody: controllers.OpenShellTerminalRequest{},
+			resps: []respUnit{
+				{http.StatusCreated, controllers.ShellTerminalEnvelope{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodDelete, path: "/api/v1/shell-terminals/{handleId}", id: "closeShellTerminal", tag: "shellTerminals",
+			summary:    "Close a standalone shell terminal and destroy its PTY",
+			pathParams: []any{controllers.ShellTerminalHandleIDParam{}},
+			resps: []respUnit{
+				{http.StatusNoContent, nil},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+	}
 }
 
 func agentOperations() []operation {
@@ -420,11 +482,29 @@ func importOperations() []operation {
 	}
 }
 
+// devOperations declares developer-only API operations. Must stay 1:1 with
+// the routes DevController.Register mounts (enforced by the parity test).
+func devOperations() []operation {
+	return []operation{
+		{
+			method: http.MethodPost, path: "/api/v1/dev/import-projects", id: "runDevImportProjects", tag: "dev",
+			summary: "Run the developer project-registry import through the daemon store",
+			reqBody: controllers.DevImportProjectsRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.DevImportProjectsResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+	}
+}
+
 func notificationOperations() []operation {
 	return []operation{
 		{
 			method: http.MethodGet, path: "/api/v1/notifications", id: "listNotifications", tag: "notifications",
-			summary:    "List unread notifications",
+			summary:    "List notification history",
 			pathParams: []any{controllers.ListNotificationsQuery{}},
 			resps: []respUnit{
 				{http.StatusOK, controllers.ListNotificationsResponse{}},
@@ -572,7 +652,7 @@ func eventOperations() []operation {
 	}
 }
 
-// projectOperations declares the 4 canonical /projects operations. The set must
+// projectOperations declares the canonical /projects operations. The set must
 // stay 1:1 with the routes ProjectsController.Register mounts —
 // TestRouteSpecParity fails the build otherwise.
 func projectOperations() []operation {
@@ -612,6 +692,18 @@ func projectOperations() []operation {
 			pathParams: []any{controllers.ProjectIDParam{}},
 			resps: []respUnit{
 				{http.StatusOK, controllers.GetProjectResponse{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPut, path: "/api/v1/projects/{id}", id: "updateProjectSettings", tag: "projects",
+			summary:    "Atomically replace a project's display name and config",
+			pathParams: []any{controllers.ProjectIDParam{}},
+			reqBody:    projectsvc.UpdateSettingsInput{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.ProjectResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
 			},
@@ -659,7 +751,7 @@ func sessionOperations() []operation {
 			summary: "Spawn a new agent session",
 			reqBody: controllers.SpawnSessionRequest{},
 			resps: []respUnit{
-				{http.StatusCreated, controllers.SessionResponse{}},
+				{http.StatusCreated, controllers.SpawnSessionResponse{}},
 				{http.StatusBadRequest, envelope.APIError{}},
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
@@ -785,6 +877,19 @@ func sessionOperations() []operation {
 			},
 		},
 		{
+			method: http.MethodPatch, path: "/api/v1/sessions/{sessionId}/merge-policy", id: "setSessionMergePolicy", tag: "sessions",
+			summary:    "Configure whether PR completion terminates the session",
+			pathParams: []any{controllers.SessionIDParam{}},
+			reqBody:    controllers.SetSessionMergePolicyRequest{},
+			resps: []respUnit{
+				{http.StatusOK, controllers.SetSessionMergePolicyResponse{}},
+				{http.StatusBadRequest, envelope.APIError{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
+			},
+		},
+		{
 			method: http.MethodPost, path: "/api/v1/sessions/cleanup", id: "cleanupSessions", tag: "sessions",
 			summary:    "Clean up terminated session workspaces",
 			pathParams: []any{controllers.CleanupSessionsQuery{}},
@@ -803,6 +908,18 @@ func sessionOperations() []operation {
 				{http.StatusNotFound, envelope.APIError{}},
 				{http.StatusConflict, envelope.APIError{}},
 				{http.StatusInternalServerError, envelope.APIError{}},
+			},
+		},
+		{
+			method: http.MethodPost, path: "/api/v1/sessions/{sessionId}/resume-agent", id: "resumeAgent", tag: "sessions",
+			summary:    "Resume an exited agent in its existing session",
+			pathParams: []any{controllers.SessionIDParam{}},
+			resps: []respUnit{
+				{http.StatusOK, controllers.ResumeAgentResponse{}},
+				{http.StatusNotFound, envelope.APIError{}},
+				{http.StatusConflict, envelope.APIError{}},
+				{http.StatusInternalServerError, envelope.APIError{}},
+				{http.StatusNotImplemented, envelope.APIError{}},
 			},
 		},
 		{

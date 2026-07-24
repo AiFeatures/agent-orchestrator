@@ -1,5 +1,6 @@
 import type { PRState, PullRequestFacts, WorkspaceSummary } from "../types/workspace";
 import type { SessionPRSummary } from "../hooks/useSessionScmSummary";
+import type { ShellTerminal } from "../hooks/useShellTerminals";
 
 const now = new Date().toISOString();
 const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60 * 1000).toISOString();
@@ -21,6 +22,19 @@ const demoPr = (
 	reviewComments: review === "changes_requested",
 	updatedAt: now,
 });
+
+// Standalone shell terminals for the browser-preview build. The real ones need
+// a daemon to spawn a PTY, so the preview shows representative tabs instead —
+// enough to exercise the tab strip's layout, selection, and close control.
+export const mockShellTerminals: ShellTerminal[] = [
+	{
+		handleId: "shellterm-demo-1",
+		projectId: "ao-demo",
+		workingDir: "/Users/demo/Projects/ao-demo",
+		title: "ao-demo",
+		createdAt: now,
+	},
+];
 
 export const mockWorkspaces: WorkspaceSummary[] = [
 	{
@@ -55,7 +69,6 @@ export const mockWorkspaces: WorkspaceSummary[] = [
 				provider: "codex",
 				branch: "demo/dashboard-screenshot",
 				status: "working",
-				displayStatus: "working",
 				createdAt: hoursAgo(3),
 				updatedAt: minutesAgo(2),
 				activity: { state: "active", lastActivityAt: minutesAgo(2) },
@@ -75,7 +88,6 @@ export const mockWorkspaces: WorkspaceSummary[] = [
 				provider: "claude-code",
 				branch: "demo/terminal-polish",
 				status: "changes_requested",
-				displayStatus: "needs_you",
 				createdAt: hoursAgo(5),
 				updatedAt: minutesAgo(18),
 				activity: { state: "waiting_input", lastActivityAt: minutesAgo(18) },
@@ -95,7 +107,6 @@ export const mockWorkspaces: WorkspaceSummary[] = [
 				provider: "codex",
 				branch: "demo/browser-preview-stack",
 				status: "review_pending",
-				displayStatus: "needs_you",
 				createdAt: hoursAgo(7),
 				updatedAt: minutesAgo(7),
 				activity: { state: "idle", lastActivityAt: minutesAgo(7) },
@@ -122,7 +133,6 @@ export const mockWorkspaces: WorkspaceSummary[] = [
 				provider: "opencode",
 				branch: "demo/project-settings-copy",
 				status: "review_pending",
-				displayStatus: "unknown",
 				createdAt: hoursAgo(4),
 				updatedAt: minutesAgo(31),
 				activity: { state: "idle", lastActivityAt: minutesAgo(31) },
@@ -137,7 +147,6 @@ export const mockWorkspaces: WorkspaceSummary[] = [
 				provider: "codex",
 				branch: "demo/readme-assets",
 				status: "mergeable",
-				displayStatus: "mergeable",
 				createdAt: hoursAgo(9),
 				updatedAt: minutesAgo(5),
 				activity: { state: "idle", lastActivityAt: minutesAgo(5) },
@@ -156,7 +165,6 @@ export const mockWorkspaces: WorkspaceSummary[] = [
 				provider: "codex",
 				branch: "demo/new-task-flake",
 				status: "ci_failed",
-				displayStatus: "needs_you",
 				createdAt: hoursAgo(8),
 				updatedAt: minutesAgo(46),
 				activity: { state: "idle", lastActivityAt: minutesAgo(46) },
@@ -252,6 +260,8 @@ const prSummary = (sessionId: string, number: number, overrides: Partial<Session
 			prUrl: url,
 			conflictFiles: [],
 		},
+		createdAt: facts?.updatedAt ?? now,
+		stateChangedAt: facts?.updatedAt ?? now,
 		updatedAt: facts?.updatedAt ?? now,
 		observedAt: facts?.updatedAt ?? now,
 		ciObservedAt: facts?.updatedAt ?? now,
@@ -261,6 +271,33 @@ const prSummary = (sessionId: string, number: number, overrides: Partial<Session
 };
 
 export const mockSessionScmSummaries: Record<string, SessionPRSummary[]> = {
+	"demo-review-stack": [
+		prSummary("demo-review-stack", 321, {
+			createdAt: hoursAgo(2),
+			stateChangedAt: hoursAgo(2),
+		}),
+		prSummary("demo-review-stack", 319, {
+			createdAt: hoursAgo(6),
+			stateChangedAt: hoursAgo(5),
+		}),
+		prSummary("demo-review-stack", 320, {
+			createdAt: hoursAgo(4),
+			stateChangedAt: hoursAgo(3),
+		}),
+		prSummary("demo-review-stack", 317, {
+			url: "https://github.com/acme-inc/ao-demo/pull/317",
+			htmlUrl: "https://github.com/acme-inc/ao-demo/pull/317",
+			state: "merged",
+			createdAt: hoursAgo(7),
+			stateChangedAt: hoursAgo(1),
+			mergeability: {
+				state: "mergeable",
+				reasons: [],
+				prUrl: "https://github.com/acme-inc/ao-demo/pull/317",
+				conflictFiles: [],
+			},
+		}),
+	],
 	"fix-auth-timeouts": [
 		prSummary("fix-auth-timeouts", 184, {
 			changedFiles: 5,

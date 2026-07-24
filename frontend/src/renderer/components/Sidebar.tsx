@@ -5,7 +5,6 @@ import { useEffect, useRef, useState } from "react";
 import type { UpdateStatus } from "../../main/update-settings";
 import {
 	newestActiveOrchestrator,
-	sessionIsActive,
 	type WorkspaceSession,
 	type WorkspaceSummary,
 	workerSessions,
@@ -16,6 +15,7 @@ import { workspaceQueryKey } from "../hooks/useWorkspaceQuery";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
 import { renameSession } from "../lib/rename-session";
 import { useResizable } from "../hooks/useResizable";
+import { useShellMaybe } from "../lib/shell-context";
 import { useUpdateStatus } from "../hooks/useUpdateStatus";
 import {
 	DropdownMenu,
@@ -43,18 +43,18 @@ import {
 } from "./ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { OrchestratorIcon } from "./icons";
-import aoLogo from "../assets/ao-logo.png";
+import aoLogo from "../../../assets/ao-logo.svg";
 import { cn } from "../lib/utils";
 import { useUiStore } from "../stores/ui-store";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { CreateProjectFlow, type CreateProjectInput } from "./CreateProjectFlow";
 import { ResizeHandle } from "./ResizeHandle";
+import { isMacPlatform, isWindowsPlatform } from "../lib/platform";
 
-// The macOS hiddenInset traffic lights and the fixed TitlebarNav overlay live
-// in the full-width topbar's left inset (_shell renders the bar above the
-// sidebar row); the sidebar itself starts below the 56px header, so its border
-// never crosses the titlebar strip.
-const isMac = typeof navigator !== "undefined" && /Mac|iPod|iPhone|iPad/.test(navigator.userAgent);
+// On macOS the native traffic lights and fixed TitlebarNav occupy the titlebar
+// above this surface. Win/Linux hang the sidebar under their shell chrome.
+const isMac = isMacPlatform();
+const isWindows = isWindowsPlatform();
 const noDragStyle = isMac ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
 
 // Shared styling for the per-project hover action buttons (dashboard,
@@ -74,9 +74,12 @@ const SIDEBAR_COLLAPSE_THRESHOLD = SIDEBAR_MIN_WIDTH;
 type SidebarProps = {
 	/** Hide the sidebar's right edge stroke on the welcome board inset chrome. */
 	hideEdgeBorder?: boolean;
+	/** Render the expanded sidebar over content without reserving layout width. */
+	isOverlay?: boolean;
 	underTopbar?: boolean;
 	/** Chrome height to clear when underTopbar is set. Defaults to the 56px shell toolbar. */
 	topbarOffset?: "toolbar" | "titlebar";
+	onPreviewLeave?: () => void;
 	workspaceError?: string;
 	workspaces: WorkspaceSummary[];
 	onCreateProject: (input: CreateProjectInput) => Promise<void>;
@@ -103,21 +106,23 @@ function useSelection() {
 	};
 }
 
-// 6px session dot: mirrors the board's status language so the sidebar can be
-// scanned without opening the project board.
+// Activity controls motion; live PR context controls an active session's
+// color. Idle activity remains visible as a static gray dot.
 function SessionDot({ session }: { session: WorkspaceSession }) {
 	const dot = getSessionDotView(session);
 	return <span aria-hidden="true" className={cn("mt-px h-1.5 w-1.5 shrink-0 rounded-full", dot.className)} />;
 }
 
 // Built on shadcn's sidebar primitives (components/ui/sidebar): the provider in
-// _shell owns open state (synced to the ui-store) and `collapsible="icon"`
-// replaces the old hand-rolled CollapsedRail — the same tree restyles itself
-// via group-data-[collapsible=icon] into the 48px letter rail.
+// _shell owns the persistent open state plus a transient hover-preview state.
+// Collapsed sidebars move fully off-canvas; previews return as overlays without
+// reserving layout width.
 export function Sidebar({
 	hideEdgeBorder = false,
+	isOverlay = false,
 	underTopbar = true,
 	topbarOffset = "toolbar",
+	onPreviewLeave,
 	workspaceError,
 	workspaces,
 	onCreateProject,
@@ -130,6 +135,9 @@ export function Sidebar({
 	const [expandedChromeVisible, setExpandedChromeVisible] = useState(!isCollapsed);
 	// One IPC subscription for both footer variants of the restart-to-update prompt.
 	const updateStatus = useUpdateStatus();
+	// Daemon status for the smoke suite's sr-only mirror in the footer. Null when
+	// rendered outside the shell (unit tests) — the mirror simply doesn't render.
+	const daemonStatus = useShellMaybe()?.daemonStatus ?? null;
 
 	useEffect(() => {
 		if (isCollapsed) {
@@ -187,27 +195,35 @@ export function Sidebar({
 	});
 
 	return (
-		// The container is fixed-positioned by the shadcn primitive; offset it
-		// below the shell chrome so the bar runs edge-to-edge above it (same
-		// override as shadcn's header-above-sidebar block). Prefer the 56px
-		// toolbar offset; on Windows welcome only the 36px WindowTitlebar is
-		// present, so hang below that instead of covering File/Edit/….
+		// Pinned sidebars start below shell chrome. Hover previews paint a
+		// full-height surface behind the titlebar while their content keeps the
+		// same chrome clearance, leaving the titlebar controls unobstructed.
 		<SidebarRoot
-			collapsible="icon"
+			collapsible="offcanvas"
 			data-expanded-chrome={expandedChromeVisible ? "visible" : "hidden"}
+			onPointerLeave={onPreviewLeave}
+			overlay={isOverlay}
 			className={cn(
 				hideEdgeBorder ? "border-transparent" : "border-r-0 group-data-[side=left]:border-r-0",
-				underTopbar
-					? topbarOffset === "titlebar"
-						? "top-9 h-[calc(100svh-2.25rem)]!"
-						: "top-14 h-[calc(100svh-3.5rem)]!"
-					: "top-0 h-svh!",
+				isOverlay && "z-sidebar-preview shadow-2xl",
+				isOverlay
+					? "top-0 h-svh!"
+					: underTopbar
+						? topbarOffset === "titlebar"
+							? "top-9 h-[calc(100svh-2.25rem)]!"
+							: "top-14 h-[calc(100svh-3.5rem)]!"
+						: "top-0 h-svh!",
 			)}
 		>
-			<SidebarHeader className="gap-0 p-0 pl-2.5 pr-1.75 pt-2.5 group-data-[collapsible=icon]:px-1.5 group-data-[collapsible=icon]:pt-2">
+			<SidebarHeader
+				className={cn(
+					"gap-0 p-0 pl-1.5 pr-1.75 pt-1 group-data-[collapsible=icon]:px-1.5 group-data-[collapsible=icon]:pt-1",
+					isOverlay && (topbarOffset === "titlebar" ? "pt-10!" : "pt-15!"),
+				)}
+			>
 				{/* Brand (project-sidebar__brand); in the icon rail it becomes the old
             36px board button wrapping the 22px accent mark. */}
-				<div className="flex shrink-0 items-center gap-2.5 px-2 pb-4.5 group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:gap-1 group-data-[collapsible=icon]:px-0 group-data-[collapsible=icon]:pb-2">
+				<div className="flex shrink-0 items-center gap-2.5 px-1.5 pb-3 group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:gap-1 group-data-[collapsible=icon]:px-0 group-data-[collapsible=icon]:pb-2">
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
@@ -237,9 +253,7 @@ export function Sidebar({
 							nightly
 						</span>
 					)}
-					{/* On macOS the toggle lives in the titlebar cluster instead. One trigger
-					    for Win/Linux — SidebarTrigger already toggles open/closed. */}
-					{!isMac && (
+					{!isMac && !isWindows && (
 						<Tooltip>
 							<TooltipTrigger asChild>
 								<SidebarTrigger
@@ -260,23 +274,24 @@ export function Sidebar({
 				</div>
 			</SidebarHeader>
 
-			<SidebarContent className="gap-0 pl-2.5 pr-1.75 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-1.5">
-				<SidebarGroup className="p-0">
-					{/* Section label (project-sidebar__nav-label) */}
-					<div className="sidebar-expanded-chrome flex shrink-0 items-center justify-between px-2 pb-2 group-data-[collapsible=icon]:hidden">
-						<SidebarGroupLabel className="h-auto rounded-none p-0 text-2xs font-semibold uppercase tracking-wide-lg text-passive">
-							Projects
-						</SidebarGroupLabel>
-						{/* Hide on the empty start page — import lives in the welcome board. */}
-						{workspaces.length > 0 ? (
-							<CreateProjectButton onCreateProject={onCreateProject} onInitializeProject={onInitializeProject} />
-						) : null}
-					</div>
+			{/* Section label (project-sidebar__nav-label) */}
+			<div className="sidebar-expanded-chrome flex shrink-0 items-center justify-between px-1.5 pb-2 group-data-[collapsible=icon]:hidden">
+				<SidebarGroupLabel className="h-auto rounded-none p-0 text-2xs font-semibold uppercase tracking-wide-lg text-passive">
+					Projects
+				</SidebarGroupLabel>
+				<CreateProjectButton
+					hideTrigger={workspaces.length === 0}
+					onCreateProject={onCreateProject}
+					onInitializeProject={onInitializeProject}
+				/>
+			</div>
 
+			<SidebarContent className="scrollbar-none gap-0 pl-1.5 pr-1.75 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-1.5">
+				<SidebarGroup className="p-0">
 					{/* Tree (project-sidebar__tree) */}
 					<SidebarGroupContent>
 						{workspaceError ? (
-							<div className="sidebar-expanded-chrome px-2 py-3 group-data-[collapsible=icon]:hidden">
+							<div className="sidebar-expanded-chrome px-1.5 py-3 group-data-[collapsible=icon]:hidden">
 								<p className="text-xs text-foreground">Could not load projects.</p>
 								<p className="mt-1 text-caption text-passive">{workspaceError}</p>
 							</div>
@@ -292,22 +307,29 @@ export function Sidebar({
 										onRemoveProject={onRemoveProject}
 									/>
 								))}
-								{isCollapsed && (
-									<CreateProjectListItem onCreateProject={onCreateProject} onInitializeProject={onInitializeProject} />
-								)}
+								{isCollapsed && <CreateProjectListItem />}
 							</SidebarMenu>
 						)}
 					</SidebarGroupContent>
 				</SidebarGroup>
 			</SidebarContent>
 
-			{/* Footer — Settings opens the global settings page directly. */}
-			<SidebarFooter className="relative mb-2 mt-auto gap-0 overflow-hidden px-1.75 pb-2.5 pt-1.75 transition-[padding] duration-200 ease-linear group-data-[collapsible=icon]:min-h-[64px] group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-1.5 group-data-[collapsible=icon]:pb-1.5 group-data-[collapsible=icon]:pt-1.5">
-				<div className="sidebar-expanded-chrome relative flex w-full min-w-[186px] flex-col gap-1 transition-[opacity,transform] duration-150 ease-out group-data-[collapsible=icon]:pointer-events-none group-data-[collapsible=icon]:-translate-x-2 group-data-[collapsible=icon]:opacity-0">
+			{/* Footer — Settings opens the global settings page directly.
+			    Bottom margin matches the framed center-panel inset so the
+			    button and panel share a bottom edge (no top divider). */}
+			<SidebarFooter className="relative mt-auto mb-5 gap-0 overflow-hidden px-2.5 pb-0 pt-1.5 transition-[padding] duration-200 ease-linear group-data-[collapsible=icon]:min-h-16 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-1.5 group-data-[collapsible=icon]:pb-0 group-data-[collapsible=icon]:pt-1.5">
+				{/* Always-present daemon status mirror for the smoke suite: no visible
+				    daemon-state copy is guaranteed to be mounted elsewhere. */}
+				{daemonStatus && (
+					<span aria-hidden="true" className="sr-only" data-testid="daemon-status" data-state={daemonStatus.state}>
+						daemon {daemonStatus.state}
+					</span>
+				)}
+				<div className="sidebar-expanded-chrome relative flex w-full min-w-46.5 flex-col gap-1 transition-[opacity,transform] duration-150 ease-out group-data-[collapsible=icon]:pointer-events-none group-data-[collapsible=icon]:-translate-x-2 group-data-[collapsible=icon]:opacity-0">
 					<RestartToUpdateRow status={updateStatus} />
 					<button
 						aria-label="Settings"
-						className="flex w-full items-center justify-center gap-2.5 rounded-md border border-border p-2 text-control font-medium text-passive transition-colors hover:bg-interactive-hover hover:text-foreground [&_svg]:size-icon-lg [&_svg]:text-passive"
+						className="flex w-full items-center justify-center gap-2.5 rounded-settings-row bg-interactive-hover px-2.5 py-2.5 text-control font-medium text-muted-foreground transition-colors hover:bg-interactive-hover hover:text-foreground [&_svg]:size-icon-lg [&_svg]:shrink-0 [&_svg]:text-muted-foreground"
 						onClick={() => selection.goGlobalSettings()}
 						type="button"
 					>
@@ -315,13 +337,13 @@ export function Sidebar({
 						<span className="tracking-tight">Settings</span>
 					</button>
 				</div>
-				<div className="pointer-events-none absolute inset-x-1.5 top-[7px] flex min-h-[52px] flex-col items-center justify-center gap-1 opacity-0 transition-opacity duration-150 ease-out group-data-[collapsible=icon]:pointer-events-auto group-data-[collapsible=icon]:opacity-100">
+				<div className="pointer-events-none absolute inset-x-1.5 bottom-0 top-auto flex min-h-row-md flex-col items-center justify-end gap-1 opacity-0 transition-opacity duration-150 ease-out group-data-[collapsible=icon]:pointer-events-auto group-data-[collapsible=icon]:opacity-100">
 					<RestartToUpdateRailButton status={updateStatus} />
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
 								aria-label="Settings"
-								className="grid size-control-board place-items-center rounded-lg border border-border text-passive transition-colors hover:bg-interactive-hover hover:text-foreground [&_svg]:size-icon-base"
+								className="grid size-control-board place-items-center rounded-settings-row bg-interactive-hover text-muted-foreground transition-colors hover:bg-interactive-hover hover:text-foreground [&_svg]:size-icon-base"
 								onClick={() => selection.goGlobalSettings()}
 								type="button"
 							>
@@ -334,7 +356,7 @@ export function Sidebar({
 			</SidebarFooter>
 
 			<ResizeHandle
-				className="group-data-[collapsible=icon]:hidden"
+				className="group-data-[state=collapsed]:hidden"
 				onDoubleClick={onResizeDoubleClick}
 				onPointerDown={onResizePointerDown}
 				side="right"
@@ -374,9 +396,10 @@ function ProjectItem({
 	const restartingProjectIds = useUiStore((state) => state.restartingProjectIds);
 	const isProjectRestarting = restartingProjectIds.has(workspace.id);
 	const requestNewTask = useUiStore((state) => state.requestNewTask);
-	// Live workers only: merged/terminated sessions leave the sidebar and stay
-	// reachable through the board's Done / Terminated bar (SessionsBoard).
-	const sessions = workerSessions(workspace.sessions).filter(sessionIsActive);
+	// Keep completed PR sessions reachable while their runtime still exists.
+	// Only termination removes a worker from the sidebar; archived sessions stay
+	// reachable through SessionsBoard.
+	const sessions = workerSessions(workspace.sessions).filter((session) => session.isTerminated !== true);
 	// The project's live orchestrator (if any) backs the hover Orchestrator
 	// button: navigate to it when present, otherwise spawn one first.
 	const orchestrator = newestActiveOrchestrator(workspace.sessions);
@@ -465,9 +488,6 @@ function ProjectItem({
 				<span className="sidebar-expanded-chrome min-w-0 flex-1 truncate group-data-[collapsible=icon]:hidden">
 					{workspace.name}
 				</span>
-				<span className="hidden h-4 min-w-4 shrink-0 place-items-center rounded bg-interactive-hover px-1 font-mono text-[10px] leading-none text-passive">
-					{sessions.length}
-				</span>
 			</SidebarMenuButton>
 			{/* Per-project actions: dashboard board, orchestrator, and a kebab
 			menu. Always visible (not hover-gated) to avoid CSS :hover group
@@ -544,7 +564,7 @@ function ProjectItem({
 			{/* project-sidebar__sessions: indented under the project parent so worker
           sessions read as children without adding a persistent guide rail. */}
 			{expanded && sessions.length > 0 && (
-				<SidebarMenuSub className="sidebar-expanded-chrome mx-0 ml-4.5 translate-x-0 gap-0 border-l-0 px-0 py-1 pl-2.5">
+				<SidebarMenuSub className="sidebar-expanded-chrome mx-0 ml-3.5 translate-x-0 gap-0 border-l-0 px-0 py-1">
 					{sessions.map((session) => (
 						<SessionRow
 							key={session.id}
@@ -618,7 +638,7 @@ function SessionRow({ session, active, onOpen }: { session: WorkspaceSession; ac
 	if (isEditing) {
 		return (
 			<SidebarMenuSubItem>
-				<div className="relative flex h-auto w-full items-center gap-2.25 rounded-sm py-1.25 pl-2.5 pr-1.5">
+				<div className="relative flex h-auto w-full items-center gap-2.25 rounded-sm py-1.25 pl-1.5 pr-1.5">
 					<SessionDot session={session} />
 					<input
 						aria-label={`Rename ${session.title}`}
@@ -651,7 +671,7 @@ function SessionRow({ session, active, onOpen }: { session: WorkspaceSession; ac
 				aria-current={active ? "page" : undefined}
 				aria-label={`Open ${session.title}`}
 				className={cn(
-					"relative flex h-auto w-full items-center gap-2.25 rounded-sm py-1.25 pl-2.5 pr-7 text-left outline-hidden transition-[color]",
+					"relative flex h-auto w-full items-center gap-2.25 rounded-sm py-1.25 pl-1.5 pr-7 text-left outline-hidden transition-[color]",
 					"before:absolute before:top-1.5 before:bottom-1.5 before:left-0 before:w-px before:rounded-full before:bg-transparent",
 					"hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring",
 					active && "text-foreground before:bg-accent",
@@ -696,7 +716,7 @@ function RestartToUpdateRow({ status }: { status: UpdateStatus }) {
 		<button
 			aria-label={`Restart to install update${status.version ? ` v${status.version}` : ""}`}
 			className={cn(
-				"flex w-full items-center gap-2.5 rounded-md p-2 text-left text-control font-medium transition-colors",
+				"flex w-full items-center gap-2.5 rounded-settings-row p-2.5 text-left text-control font-medium transition-colors",
 				escalated
 					? "border border-working/35 bg-working/12 text-working hover:bg-working/18 [&_svg]:text-working"
 					: "text-passive hover:bg-interactive-hover hover:text-foreground [&_svg]:text-passive",
@@ -751,13 +771,14 @@ function RestartToUpdateRailButton({ status }: { status: UpdateStatus }) {
 }
 
 function CreateProjectButton({
+	hideTrigger = false,
 	onCreateProject,
 	onInitializeProject,
-}: Pick<SidebarProps, "onCreateProject" | "onInitializeProject">) {
-	// This "+" is always mounted (the collapsed rail only CSS-hides it), so it
-	// owns the ⌘N "no project in scope" fallback via openSignal — no separate
-	// delegating component needed. The collapsed-only list item does not, to
-	// avoid a double open while both are mounted.
+}: Pick<SidebarProps, "onCreateProject" | "onInitializeProject"> & { hideTrigger?: boolean }) {
+	// Single CreateProjectFlow owner for the sidebar: the header "+" stays mounted
+	// (CSS-hidden when collapsed or on the empty start page) so it can own
+	// openSignal for ⌘N on every shell route. The collapsed rail button below
+	// reuses this flow via requestCreateProject().
 	const createProjectNonce = useUiStore((state) => state.createProjectNonce);
 	return (
 		<CreateProjectFlow
@@ -771,7 +792,10 @@ function CreateProjectButton({
 					<TooltipTrigger asChild>
 						<button
 							aria-label="New project"
-							className="grid size-icon-xl place-items-center rounded-sm text-passive transition-colors hover:bg-interactive-hover hover:text-muted-foreground"
+							className={cn(
+								"grid size-icon-xl place-items-center rounded-sm text-passive transition-colors hover:bg-interactive-hover hover:text-muted-foreground",
+								hideTrigger && "hidden",
+							)}
 							disabled={disabled}
 							onClick={choosePath}
 							type="button"
@@ -786,30 +810,23 @@ function CreateProjectButton({
 	);
 }
 
-function CreateProjectListItem({
-	onCreateProject,
-	onInitializeProject,
-}: Pick<SidebarProps, "onCreateProject" | "onInitializeProject">) {
+function CreateProjectListItem() {
+	const requestCreateProject = useUiStore((state) => state.requestCreateProject);
 	return (
-		<CreateProjectFlow mode="choose" onCreateProject={onCreateProject} onInitializeProject={onInitializeProject}>
-			{({ disabled, choosePath, label }) => (
-				<SidebarMenuItem className="mb-px group-data-[collapsible=icon]:mb-0">
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<button
-								aria-label="New project"
-								className="grid h-control-board w-full place-items-center rounded-sm text-passive transition-colors hover:bg-interactive-hover hover:text-muted-foreground"
-								disabled={disabled}
-								onClick={choosePath}
-								type="button"
-							>
-								<Plus className="size-icon-sm" aria-hidden="true" />
-							</button>
-						</TooltipTrigger>
-						<TooltipContent side="right">{label}</TooltipContent>
-					</Tooltip>
-				</SidebarMenuItem>
-			)}
-		</CreateProjectFlow>
+		<SidebarMenuItem className="mb-px group-data-[collapsible=icon]:mb-0">
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<button
+						aria-label="New project"
+						className="grid h-control-board w-full place-items-center rounded-sm text-passive transition-colors hover:bg-interactive-hover hover:text-muted-foreground"
+						onClick={() => requestCreateProject()}
+						type="button"
+					>
+						<Plus className="size-icon-sm" aria-hidden="true" />
+					</button>
+				</TooltipTrigger>
+				<TooltipContent side="right">New project</TooltipContent>
+			</Tooltip>
+		</SidebarMenuItem>
 	);
 }

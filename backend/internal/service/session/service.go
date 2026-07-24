@@ -22,6 +22,7 @@ type Store interface {
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
 	RenameSession(ctx context.Context, id domain.SessionID, displayName string, updatedAt time.Time) (bool, error)
 	SetSessionPreviewURL(ctx context.Context, id domain.SessionID, previewURL string, updatedAt time.Time) (bool, error)
+	SetSessionTerminateOnPRMerge(ctx context.Context, id domain.SessionID, terminate bool, updatedAt time.Time) (bool, error)
 	GetDisplayPRFactsForSession(ctx context.Context, id domain.SessionID) (domain.PRFacts, bool, error)
 	ListPRFactsForSession(ctx context.Context, id domain.SessionID) ([]domain.PRFacts, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
@@ -43,8 +44,9 @@ type ListFilter struct {
 // commander is the command-side surface Service delegates to: the
 // *sessionmanager.Manager in production, a fake in tests.
 type commander interface {
-	Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, error)
+	Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.SessionRecord, int, int, error)
 	RestoreWithMode(ctx context.Context, id domain.SessionID) (sessionmanager.RestoreResult, error)
+	ResumeAgentWithMode(ctx context.Context, id domain.SessionID) (sessionmanager.RestoreResult, error)
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
 	RetireForReplacement(ctx context.Context, id domain.SessionID) error
 	Send(ctx context.Context, id domain.SessionID, message string) error
@@ -91,6 +93,12 @@ type RestoreOutcome struct {
 	Mode    RestoreModeView `json:"restoreMode"`
 }
 
+// ResumeAgentOutcome reports the resumed read model and how AO relaunched it.
+type ResumeAgentOutcome struct {
+	Session domain.Session  `json:"session"`
+	Mode    RestoreModeView `json:"resumeMode"`
+}
+
 type scmProvider interface {
 	ParseRepository(remote string) (ports.SCMRepo, bool)
 	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
@@ -107,6 +115,7 @@ type Service struct {
 	scm                 scmProvider
 	tracker             ports.Tracker
 	clock               func() time.Time
+	dataDir             string
 	telemetry           ports.EventSink
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
@@ -132,6 +141,7 @@ type Deps struct {
 	SCM       scmProvider
 	Tracker   ports.Tracker
 	Clock     func() time.Time
+	DataDir   string
 	Telemetry ports.EventSink
 	// SignalCapable gates the no_signal status downgrade per harness; daemon
 	// wiring passes activitydispatch.SupportsHarness. Left nil, no session is
@@ -141,7 +151,7 @@ type Deps struct {
 
 // NewWithDeps wires a session service with optional PR-claim dependencies.
 func NewWithDeps(d Deps) *Service {
-	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, tracker: d.Tracker, clock: d.Clock, signalCapable: d.SignalCapable, telemetry: d.Telemetry}
+	s := &Service{manager: d.Manager, store: d.Store, prClaimer: d.PRClaimer, scm: d.SCM, tracker: d.Tracker, clock: d.Clock, dataDir: d.DataDir, signalCapable: d.SignalCapable, telemetry: d.Telemetry}
 	if s.prClaimer == nil {
 		if w, ok := d.Store.(ports.PRClaimer); ok {
 			s.prClaimer = w
@@ -153,28 +163,33 @@ func NewWithDeps(d Deps) *Service {
 	return s
 }
 
-// Spawn creates a session and returns the API-facing read model.
-func (s *Service) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Session, error) {
+// Spawn creates a session and returns the API-facing read model plus
+// ephemeral prompt size measurements.
+func (s *Service) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Session, int, int, error) {
 	project, err := s.requireProject(ctx, cfg.ProjectID)
 	if err != nil {
-		return domain.Session{}, err
+		return domain.Session{}, 0, 0, err
 	}
 	start := s.now()
 	firstSession, err := s.isFirstSession(ctx)
 	if err != nil {
-		return domain.Session{}, fmt.Errorf("count sessions: %w", err)
+		return domain.Session{}, 0, 0, fmt.Errorf("count sessions: %w", err)
 	}
 	cfg = s.withIssueContext(ctx, cfg, project)
-	rec, err := s.manager.Spawn(ctx, cfg)
+	rec, promptBytes, systemPromptBytes, err := s.manager.Spawn(ctx, cfg)
 	if err != nil {
 		s.emitSpawnFailed(cfg, err, s.now().Sub(start).Milliseconds())
-		return domain.Session{}, toAPIError(err)
+		return domain.Session{}, 0, 0, toAPIError(err)
 	}
 	s.emitSpawned(rec, s.now().Sub(start).Milliseconds())
 	if firstSession {
 		s.emitFirstSessionSpawned(rec, project)
 	}
-	return s.toSession(ctx, rec)
+	sess, err := s.toSession(ctx, rec)
+	if err != nil {
+		return domain.Session{}, 0, 0, err
+	}
+	return sess, promptBytes, systemPromptBytes, nil
 }
 
 // requireProject verifies the project is registered before any spawn write
@@ -317,17 +332,17 @@ func (s *Service) SpawnOrchestrator(ctx context.Context, projectID domain.Projec
 			return newestSession(existing), nil
 		}
 	}
-	sess, err := s.Spawn(ctx, ports.SpawnConfig{ProjectID: projectID, Kind: domain.KindOrchestrator})
+	sess, _, _, err := s.Spawn(ctx, ports.SpawnConfig{ProjectID: projectID, Kind: domain.KindOrchestrator})
 	if err != nil {
 		return domain.Session{}, err
 	}
-	if err := verifyOrchestratorReplacement(project, sess); err != nil {
+	if err := s.verifyOrchestratorReplacement(project, sess); err != nil {
 		return domain.Session{}, err
 	}
 	return sess, nil
 }
 
-const orchestratorRetireNotice = "AO is replacing this project orchestrator. Stop coordinating new work now; a fresh orchestrator will take over on the canonical branch."
+const orchestratorRetireNotice = "AO is replacing this project orchestrator. Stop coordinating new work now; a fresh orchestrator will take over in a new workspace."
 
 func (s *Service) sendRetireNotice(ctx context.Context, id domain.SessionID) error {
 	if err := s.manager.Send(ctx, id, orchestratorRetireNotice); err != nil {
@@ -336,7 +351,7 @@ func (s *Service) sendRetireNotice(ctx context.Context, id domain.SessionID) err
 	return nil
 }
 
-func verifyOrchestratorReplacement(project domain.ProjectRecord, sess domain.Session) error {
+func (s *Service) verifyOrchestratorReplacement(project domain.ProjectRecord, sess domain.Session) error {
 	if sess.IsTerminated {
 		return fmt.Errorf("orchestrator replacement verification failed: new session %s is terminated", sess.ID)
 	}
@@ -346,7 +361,7 @@ func verifyOrchestratorReplacement(project domain.ProjectRecord, sess domain.Ses
 	if expected := project.Config.Orchestrator.Harness; expected != "" && sess.Harness != expected {
 		return fmt.Errorf("orchestrator replacement verification failed: new session %s uses harness %q, want %q", sess.ID, sess.Harness, expected)
 	}
-	expectedBranch := "ao/" + serviceSessionPrefix(project) + "-orchestrator"
+	expectedBranch := sessionmanager.DefaultOrchestratorBranch(serviceSessionPrefix(project), s.dataDir)
 	if sess.Metadata.Branch != "" && sess.Metadata.Branch != expectedBranch {
 		return fmt.Errorf("orchestrator replacement verification failed: new session %s uses branch %q, want %q", sess.ID, sess.Metadata.Branch, expectedBranch)
 	}
@@ -413,6 +428,20 @@ func (s *Service) Restore(ctx context.Context, id domain.SessionID) (RestoreOutc
 	return RestoreOutcome{Session: session, Mode: restoreModeView(res.Mode)}, nil
 }
 
+// ResumeAgent relaunches an exited agent without restoring a terminated
+// session or recreating its workspace.
+func (s *Service) ResumeAgent(ctx context.Context, id domain.SessionID) (ResumeAgentOutcome, error) {
+	res, err := s.manager.ResumeAgentWithMode(ctx, id)
+	if err != nil {
+		return ResumeAgentOutcome{}, toAPIError(err)
+	}
+	session, err := s.toSession(ctx, res.Session)
+	if err != nil {
+		return ResumeAgentOutcome{}, err
+	}
+	return ResumeAgentOutcome{Session: session, Mode: restoreModeView(res.Mode)}, nil
+}
+
 func restoreModeView(mode sessionmanager.RestoreMode) RestoreModeView {
 	switch mode {
 	case sessionmanager.RestoreModeNative:
@@ -475,6 +504,19 @@ func (s *Service) SetPreview(ctx context.Context, id domain.SessionID, previewUR
 	updated, err := s.store.SetSessionPreviewURL(ctx, id, previewURL, time.Now().UTC())
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("set preview url %s: %w", id, err)
+	}
+	if !updated {
+		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	return s.Get(ctx, id)
+}
+
+// SetTerminateOnPRMerge persists the user's merge-completion lifecycle policy
+// and returns the refreshed read model.
+func (s *Service) SetTerminateOnPRMerge(ctx context.Context, id domain.SessionID, terminate bool) (domain.Session, error) {
+	updated, err := s.store.SetSessionTerminateOnPRMerge(ctx, id, terminate, time.Now().UTC())
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("set terminate-on-pr-merge %s: %w", id, err)
 	}
 	if !updated {
 		return domain.Session{}, apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
@@ -592,6 +634,15 @@ func toAPIError(err error) error {
 		return apierr.Conflict("SESSION_NOT_RESTORABLE", "Session is not restorable", nil)
 	case errors.Is(err, sessionmanager.ErrTerminated):
 		return apierr.Conflict("SESSION_TERMINATED", "Session is terminated", nil)
+	case errors.Is(err, sessionmanager.ErrAgentExited):
+		return apierr.Conflict("AGENT_EXITED",
+			"The agent process exited; relaunch it before sending another message", nil)
+	case errors.Is(err, sessionmanager.ErrAgentNotExited):
+		return apierr.Conflict("AGENT_NOT_EXITED",
+			"The agent is still running; only exited agents can be resumed", nil)
+	case errors.Is(err, sessionmanager.ErrResumeInProgress):
+		return apierr.Conflict("AGENT_RESUME_IN_PROGRESS",
+			"The agent is already being resumed", nil)
 	case errors.Is(err, sessionmanager.ErrAwaitingDecision):
 		return apierr.Conflict("SESSION_AWAITING_DECISION",
 			"Session is paused on a permission decision; answer it in the session terminal first", nil)
@@ -606,6 +657,8 @@ func toAPIError(err error) error {
 		return apierr.Invalid("UNKNOWN_HARNESS", err.Error(), nil)
 	case errors.Is(err, sessionmanager.ErrMissingHarness):
 		return apierr.Invalid("AGENT_REQUIRED", err.Error(), nil)
+	case errors.Is(err, sessionmanager.ErrScratchBranchUnsupported):
+		return apierr.Invalid("SCRATCH_BRANCH_UNSUPPORTED", err.Error(), nil)
 	case errors.Is(err, ports.ErrWorkspaceBranchCheckedOutElsewhere):
 		return apierr.Conflict("BRANCH_CHECKED_OUT_ELSEWHERE", err.Error(), nil)
 	case errors.Is(err, ports.ErrWorkspaceBranchNotFetched):
@@ -626,7 +679,13 @@ func (s *Service) toSession(ctx context.Context, rec domain.SessionRecord) (doma
 	if err != nil {
 		return domain.Session{}, fmt.Errorf("pr facts %s: %w", rec.ID, err)
 	}
-	return domain.Session{SessionRecord: rec, Status: deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)), TerminalHandleID: rec.Metadata.RuntimeHandleID, PRs: prs}, nil
+	return domain.Session{
+		SessionRecord:    rec,
+		Status:           deriveStatus(rec, prs, s.now(), s.harnessSignals(rec.Harness)),
+		SCMStatus:        deriveSCMStatus(prs),
+		TerminalHandleID: rec.Metadata.RuntimeHandleID,
+		PRs:              prs,
+	}, nil
 }
 
 // now tolerates a zero-value Service (tests construct the struct literally

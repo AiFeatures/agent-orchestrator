@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BrowserNavState, BrowserRect } from "../../main/browser-view-host";
 import type { BrowserAnnotationCancelPayload, BrowserAnnotationSubmitPayload } from "../../shared/browser-annotations";
+import { OPEN_DIALOG_OR_MENU_SELECTOR } from "../lib/dom-selectors";
 
 export type { BrowserNavState };
 
@@ -54,9 +55,6 @@ const EMPTY_NAV_STATE: BrowserNavState = {
 };
 
 const HIDDEN_RECT: BrowserRect = { x: 0, y: 0, width: 0, height: 0 };
-
-const OPEN_MODAL_SELECTOR =
-	'[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"], [role="menu"][data-state="open"]';
 
 // The native WebContentsView is a window-level overlay, so DOM `overflow:
 // hidden` never clips it — it paints wherever the slot's bounding box lands.
@@ -139,6 +137,16 @@ export function useBrowserView({
 	}, []);
 
 	const measureAndSend = useCallback(() => {
+		// measureAndSend runs both from the scheduleMeasure() rAF callback and as a
+		// direct synchronous call (parking on overlay open, the settle timer). A
+		// direct call may land while a scheduled frame is still queued, so cancel
+		// that live handle rather than blindly nulling it — otherwise the
+		// scheduleMeasure() dedupe guard and cancelScheduledMeasure() cleanup would
+		// both trust a frameRef that no longer reflects the pending frame.
+		if (frameRef.current !== null) {
+			if (window.cancelAnimationFrame) window.cancelAnimationFrame(frameRef.current);
+			window.clearTimeout(frameRef.current);
+		}
 		frameRef.current = null;
 		const id = viewIdRef.current;
 		const node = slotNodeRef.current;
@@ -324,7 +332,7 @@ export function useBrowserView({
 			mirrorTimerRef.current = null;
 		};
 		const update = () => {
-			const open = document.querySelector(OPEN_MODAL_SELECTOR) !== null;
+			const open = document.querySelector(OPEN_DIALOG_OR_MENU_SELECTOR) !== null;
 			if (open === modalOpenRef.current) return;
 			modalOpenRef.current = open;
 			if (open) {
@@ -332,7 +340,13 @@ export function useBrowserView({
 				const id = viewIdRef.current;
 				if (id && activeRef.current && hasUrlRef.current) {
 					runMirror(id);
-					scheduleMeasure();
+					// Park the native view synchronously, in the same tick the overlay
+					// opened. `modalOpenRef` is already true, so measureAndSend() emits
+					// the `parked: true` bounds now instead of a frame later — deferring
+					// to rAF leaves a ~16ms window where the live view paints over the
+					// freshly-opened dropdown, which stacks into a stuck overlay under
+					// rapid toggling. rAF still refines geometry on later resize/scroll.
+					measureAndSend();
 				} else {
 					sendHiddenBounds();
 				}
@@ -349,14 +363,27 @@ export function useBrowserView({
 		};
 		update();
 		const observer = new MutationObserver(update);
-		observer.observe(document.body, { childList: true });
+		// Radix reuses its portal node and flips `data-state` in place rather than
+		// adding/removing a body child, so a `childList`-only observer misses the
+		// open/close transition under rapid toggling and `modalOpenRef` desyncs.
+		// Watch subtree attribute flips on `data-state` too so the transition is
+		// always observed. This widens the firing rate a lot — `data-state` is used
+		// across Radix (tooltips, accordions, selects, switches, …), so `update()`
+		// now runs a document-wide querySelector on activity anywhere in the app
+		// before it can bail. Cheap enough in practice, but not free.
+		observer.observe(document.body, {
+			childList: true,
+			subtree: true,
+			attributes: true,
+			attributeFilter: ["data-state"],
+		});
 		return () => {
 			observer.disconnect();
 			clearMirrorTimer();
 			mirrorTokenRef.current += 1;
 			stopMirrorStream();
 		};
-	}, [hasNativeBrowser, runMirror, scheduleMeasure, scheduleSettleMeasure, sendHiddenBounds, stopMirrorStream]);
+	}, [hasNativeBrowser, measureAndSend, runMirror, scheduleSettleMeasure, sendHiddenBounds, stopMirrorStream]);
 
 	useEffect(() => {
 		const handle = () => scheduleMeasure();

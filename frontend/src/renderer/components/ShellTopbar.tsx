@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { GitBranch, LayoutDashboard, PanelRightClose, PanelRightOpen, Plus, Square, Trash2 } from "lucide-react";
 import { useState } from "react";
@@ -10,52 +10,48 @@ import {
 	type WorkspaceSession,
 } from "../types/workspace";
 import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
-import { apiClient, apiErrorMessage } from "../lib/api-client";
+import { useTerminateSession } from "../hooks/useTerminateSession";
 import { spawnOrchestrator } from "../lib/spawn-orchestrator";
 import { addRendererExceptionStep, captureRendererEvent, captureRendererException } from "../lib/telemetry";
 import { useUiStore } from "../stores/ui-store";
 import { OrchestratorIcon } from "./icons";
-import { cn } from "../lib/utils";
 import { getAgentActivityView } from "../lib/session-presentation";
+import { isLinuxPlatform, isMacPlatform, isWindowsPlatform, usesBoardActionsInPanel } from "../lib/platform";
 import { StatusPill } from "./StatusPill";
-import {
-	TopbarButton,
-	TopbarKillError,
-	topbarHeaderClass,
-	topbarHeaderMacClass,
-	topbarProjectLabelClass,
-} from "./TopbarButton";
+import { TopbarButton, TopbarKillError, topbarHeaderClass, topbarProjectLabelClass } from "./TopbarButton";
 
-const isMac = typeof navigator !== "undefined" && /Mac|iPod|iPhone|iPad/.test(navigator.userAgent);
-const isLinux =
-	typeof navigator !== "undefined" &&
-	((navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ?? navigator.platform)
-		.toLowerCase()
-		.includes("linux");
+const isMac = isMacPlatform();
+const isLinux = isLinuxPlatform();
+const isWindows = isWindowsPlatform();
+const boardActionsInPanel = usesBoardActionsInPanel();
 const dragStyle = isMac ? ({ WebkitAppRegion: "drag" } as React.CSSProperties) : undefined;
 const noDragStyle = isMac ? ({ WebkitAppRegion: "no-drag" } as React.CSSProperties) : undefined;
 
-// The one app topbar (.dashboard-app-header), rendered by the shell layout
-// across the full window width — above both the sidebar and the route outlet —
-// so the crumb and actions sit at identical offsets on every screen and the
-// macOS traffic lights + TitlebarNav cluster live in its left inset
-// (.is-under-titlebar-nav pads past them). The
-// variant is derived from the route, not props: a sessionId in the URL swaps
-// the lead to the session identity (orchestrator crumb + mode badge, or worker
-// branch + status pill) and the actions to board/orchestrator + inspector
-// controls (orchestrators open the Kanban board; workers open their orchestrator);
-// otherwise it's the dashboard crumb plus the Orchestrator launcher when a
-// project is in scope. Merges the old DashboardTopbar/Topbar pair —
-// agent-orchestrator keeps those as two components aligned only by CSS.
+// The one app topbar (.dashboard-app-header). On Win/Linux the shell mounts it
+// inside the framed center panel; when the platform hides the shell topbar
+// (macOS), SessionView mounts the same component in-panel so Kill / Orchestrator
+// / inspector stay available. The variant is derived from the route, not props:
+// a sessionId in the URL swaps the lead to the session identity (orchestrator
+// crumb + mode badge, or worker branch + status pill) and the actions to
+// board/orchestrator + inspector controls (orchestrators open the Kanban board;
+// workers open their orchestrator); otherwise it's the dashboard crumb plus the
+// Orchestrator launcher when a project is in scope. Merges the old
+// DashboardTopbar/Topbar pair — agent-orchestrator keeps those as two components
+// aligned only by CSS.
 export function ShellTopbar() {
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
 	const params = useParams({ strict: false }) as { projectId?: string; sessionId?: string };
-	const isInspectorOpen = useUiStore((state) => state.isInspectorOpen);
+	const currentSessionId = params.sessionId;
+	const isInspectorOpen = useUiStore((state) =>
+		currentSessionId ? (state.inspectorSessions[currentSessionId]?.isOpen ?? true) : false,
+	);
 	const toggleInspector = useUiStore((state) => state.toggleInspector);
 	const restartingProjectIds = useUiStore((state) => state.restartingProjectIds);
 	const requestNewTask = useUiStore((state) => state.requestNewTask);
 	const [isSpawning, setIsSpawning] = useState(false);
+	// Board-scope spawn failures surface where the board actions render.
+	const [boardSpawnError, setBoardSpawnError] = useState<string | null>(null);
 	const all = useWorkspaceQuery().data ?? [];
 
 	const session = params.sessionId
@@ -67,18 +63,14 @@ export function ShellTopbar() {
 	// cross-project /sessions/$sessionId route still resolves a crumb. A
 	// projectId that no longer resolves (stale route after the project was
 	// removed, or data still loading) shows an empty crumb — never the raw
-	// route slug. "agent-orchestrator" is the root-board crumb only.
+	// route slug. "Board" is the root-board crumb only.
 	const projectId = session?.workspaceId ?? params.projectId;
 	const isProjectBoardRoute = !isSessionRoute && Boolean(projectId);
 	const isRootBoardRoute = !isSessionRoute && !isProjectBoardRoute;
 	const project = projectId ? all.find((workspace) => workspace.id === projectId) : undefined;
-	const projectLabel = project?.name ?? session?.workspaceName ?? (projectId ? "" : "agent-orchestrator");
+	const projectLabel = project?.name ?? session?.workspaceName ?? (projectId ? "" : "Board");
 	const orchestrator = projectId ? findProjectOrchestrator(all, projectId) : undefined;
 	const isProjectRestarting = projectId ? restartingProjectIds.has(projectId) : false;
-
-	if (isLinux && !isSessionRoute) {
-		return null;
-	}
 
 	const openBoard = () =>
 		projectId ? void navigate({ to: "/projects/$projectId", params: { projectId } }) : void navigate({ to: "/" });
@@ -88,8 +80,14 @@ export function ShellTopbar() {
 		requestNewTask(projectId);
 	};
 
+	const handleToggleInspector = () => {
+		if (!currentSessionId) return;
+		toggleInspector(currentSessionId);
+	};
+
 	const openOrchestrator = async () => {
 		if (!projectId) return;
+		setBoardSpawnError(null);
 		void addRendererExceptionStep("Orchestrator open requested", {
 			source: "orchestrator-open",
 			operation: "open_orchestrator",
@@ -120,13 +118,14 @@ export function ShellTopbar() {
 				project_id: projectId,
 			});
 			console.error("Failed to spawn orchestrator:", error);
+			setBoardSpawnError(error instanceof Error ? error.message : "Could not spawn orchestrator");
 		} finally {
 			setIsSpawning(false);
 		}
 	};
 
 	return (
-		<header className={cn(topbarHeaderClass, isMac && topbarHeaderMacClass)} style={dragStyle}>
+		<header className={topbarHeaderClass} style={dragStyle}>
 			<div className="flex min-w-0 items-center gap-3">
 				{isSessionRoute && isOrchestrator ? (
 					<div className="inline-flex min-w-0 items-center gap-2">
@@ -143,13 +142,16 @@ export function ShellTopbar() {
 					</div>
 				) : isSessionRoute ? (
 					<div className="flex min-w-0 items-center gap-3">
-						<div className="inline-flex min-w-0 items-center gap-1 font-mono text-2xs leading-none text-passive">
-							<GitBranch className="size-icon-2xs shrink-0" aria-hidden="true" />
-							<span className="truncate">{session?.branch || `session/${session?.id ?? ""}`}</span>
-						</div>
+						{session?.branch ? (
+							<div className="inline-flex min-w-0 items-center gap-1 font-mono text-2xs leading-none text-passive">
+								<GitBranch className="size-icon-2xs shrink-0" aria-hidden="true" />
+								<span className="truncate">{session.branch}</span>
+							</div>
+						) : null}
 						{session ? <SessionStatusPill session={session} /> : null}
 					</div>
-				) : isProjectBoardRoute || (isMac && isRootBoardRoute) ? null : (
+				) : (isProjectBoardRoute && boardActionsInPanel) ||
+				  (isMac && isRootBoardRoute && boardActionsInPanel) ? null : (
 					<div className="inline-flex min-w-0 items-center gap-1.5">
 						<span className={topbarProjectLabelClass}>{projectLabel}</span>
 					</div>
@@ -159,7 +161,43 @@ export function ShellTopbar() {
 			<div className="min-w-0 flex-1" />
 
 			<div className="flex shrink-0 items-center gap-1.5">
-				{!isLinux ? <NotificationCenter style={noDragStyle} /> : null}
+				{/* Native-titlebar platforms keep the bell leading the actions row; the custom titlebar pins it to the far edge. */}
+				{boardActionsInPanel && !isLinux && !isWindows ? <NotificationCenter style={noDragStyle} /> : null}
+				{!boardActionsInPanel && isProjectBoardRoute ? (
+					<>
+						{boardSpawnError ? (
+							<TopbarKillError className="max-w-content-max truncate" title={boardSpawnError}>
+								{boardSpawnError}
+							</TopbarKillError>
+						) : null}
+						<TopbarButton
+							aria-label="New task"
+							disabled={isProjectRestarting}
+							onClick={openNewTask}
+							style={noDragStyle}
+							variant="accent"
+						>
+							<Plus className="size-icon-md" aria-hidden="true" />
+							New task
+						</TopbarButton>
+						<TopbarButton
+							aria-label={orchestrator ? "Orchestrator" : "Spawn Orchestrator"}
+							disabled={isSpawning || isProjectRestarting}
+							onClick={() => void openOrchestrator()}
+							style={noDragStyle}
+							variant="primary"
+						>
+							<OrchestratorIcon className="size-icon-md" aria-hidden="true" />
+							{isProjectRestarting
+								? "Restarting…"
+								: isSpawning
+									? "Spawning…"
+									: orchestrator
+										? "Orchestrator"
+										: "Spawn Orchestrator"}
+						</TopbarButton>
+					</>
+				) : null}
 				{isSessionRoute ? (
 					<>
 						{isOrchestrator ? (
@@ -215,7 +253,7 @@ export function ShellTopbar() {
 							<TopbarButton
 								aria-label={isInspectorOpen ? "Close inspector panel" : "Open inspector panel"}
 								aria-pressed={isInspectorOpen}
-								onClick={toggleInspector}
+								onClick={handleToggleInspector}
 								style={noDragStyle}
 								title={`${isInspectorOpen ? "Close" : "Open"} inspector · ⌘⇧B`}
 								variant="icon"
@@ -229,6 +267,8 @@ export function ShellTopbar() {
 						)}
 					</>
 				) : null}
+				{/* Custom-titlebar platforms pin the bell to the far right. */}
+				{!boardActionsInPanel ? <NotificationCenter style={noDragStyle} /> : null}
 			</div>
 		</header>
 	);
@@ -248,29 +288,14 @@ export function TopbarKillButton({
 	orchestratorId?: string;
 	onKilled: (workspaceId: string, orchestratorId?: string) => void;
 }) {
-	const queryClient = useQueryClient();
 	const [confirming, setConfirming] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-
-	const kill = useMutation({
-		mutationFn: async () => {
-			void captureRendererEvent("ao.renderer.session_kill_requested", { project_id: session.workspaceId });
-			const { error: apiError } = await apiClient.POST("/api/v1/sessions/{sessionId}/kill", {
-				params: { path: { sessionId: session.id } },
-			});
-			if (apiError) throw new Error(apiErrorMessage(apiError));
-		},
-		onSuccess: () => {
-			void captureRendererEvent("ao.renderer.session_kill_succeeded", { project_id: session.workspaceId });
+	const kill = useTerminateSession({
+		onSuccess: (terminatedSession) => {
 			setConfirming(false);
-			void queryClient.invalidateQueries({ queryKey: workspaceQueryKey });
-			onKilled(session.workspaceId, orchestratorId);
-		},
-		onError: (e) => {
-			void captureRendererEvent("ao.renderer.session_kill_failed", { project_id: session.workspaceId });
-			setError(e instanceof Error ? e.message : "Kill failed");
+			onKilled(terminatedSession.workspaceId, orchestratorId);
 		},
 	});
+	const error = kill.error instanceof Error ? kill.error.message : null;
 
 	if (confirming) {
 		return (
@@ -278,7 +303,7 @@ export function TopbarKillButton({
 				<TopbarButton
 					aria-label="Confirm kill"
 					disabled={kill.isPending}
-					onClick={() => kill.mutate()}
+					onClick={() => kill.mutate(session)}
 					variant="killConfirm"
 				>
 					<Square className="size-icon-md" aria-hidden="true" />
@@ -296,7 +321,7 @@ export function TopbarKillButton({
 		<TopbarButton
 			aria-label="Kill session"
 			onClick={() => {
-				setError(null);
+				kill.reset();
 				setConfirming(true);
 			}}
 			style={noDragStyle}

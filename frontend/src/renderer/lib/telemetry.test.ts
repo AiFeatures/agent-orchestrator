@@ -10,6 +10,7 @@ import {
 	sanitizeRendererProperties,
 	startDailyActiveHeartbeat,
 } from "./telemetry";
+import { ORCHESTRATOR_SPAWN_SOURCES } from "./orchestrator-spawn-sources";
 
 function memoryStorage(initial: Record<string, string> = {}) {
 	const values = new Map(Object.entries(initial));
@@ -66,6 +67,17 @@ describe("telemetry sanitizers", () => {
 
 		expect(props).toEqual({ channel: "renderer" });
 		expect(await sanitizeRendererProperties("ao.app.active", { channel: "cli" })).toEqual({});
+	});
+
+	it("keeps only bounded session-state fallback diagnostics", async () => {
+		expect(
+			await sanitizeRendererProperties("ao.renderer.session_state_unknown", {
+				field: "status",
+				reason: "unrecognized",
+				raw_value: "future-backend-state",
+				session_id: "private-session-id",
+			}),
+		).toEqual({ field: "status", reason: "unrecognized" });
 	});
 
 	it("strips exception details down to coarse metadata", async () => {
@@ -190,8 +202,8 @@ describe("telemetry sanitizers", () => {
 		expect(badSource).not.toHaveProperty("source");
 	});
 
-	it("keeps every whitelisted spawn source, including topbar/sidebar/project_add/settings/restart", async () => {
-		for (const source of ["board", "restore_dialog", "topbar", "sidebar", "project_add", "settings", "restart"]) {
+	it("keeps every whitelisted spawn source (the shared ORCHESTRATOR_SPAWN_SOURCES list)", async () => {
+		for (const source of ORCHESTRATOR_SPAWN_SOURCES) {
 			const props = await sanitizeRendererProperties("ao.renderer.orchestrator_spawn_succeeded", {
 				project_id: "demo-project",
 				source,
