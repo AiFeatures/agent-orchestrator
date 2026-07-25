@@ -216,6 +216,8 @@
 	--color-accent-foreground: var(--bridge-accent-fg);
 	--color-accent-weak: var(--bridge-accent-weak);
 	--color-accent-dim: var(--bridge-accent-dim);
+	--color-accent-strong: var(--bridge-accent-strong);
+	--color-danger-strong: var(--bridge-danger-strong);
 	--color-ring: var(--bridge-accent);
 
 	--color-border: var(--bridge-border);
@@ -377,6 +379,12 @@
  * the shared frame inset while transient hover previews overlay this surface. */
 .sidebar-hidden .center-panel-shell {
 	padding-left: var(--size-center-panel-inline-inset);
+}
+
+/* Windows: the frameless window's custom titlebar already supplies top chrome,
+ * so drop the framed panel's top inset to give content more height. */
+.platform-windows .center-panel-shell {
+	padding-top: 0;
 }
 
 @utility settings-row-bar {

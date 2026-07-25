@@ -23,6 +23,7 @@ import {
 	quitAndInstallUpdate,
 	getUpdateStatus,
 	setUpdateSettings,
+	returnToHome,
 	type UpdateCheckOptions,
 } from "./main/auto-updater";
 import { listFeatureBuilds, getActiveFeatureBuild } from "./main/feature-builds";
@@ -56,6 +57,7 @@ import { connectSupervisor, type SupervisorLinkHandle } from "./main/supervisor-
 import { keepDaemonAlive, shouldLinkOnAttach } from "./main/daemon-owner";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
 import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
+import { buildWindowsAppMenuTemplate } from "./main/menu";
 
 // Globals injected at compile time by @electron-forge/plugin-vite.
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -290,37 +292,7 @@ function appendDaemonOutput(text: string): void {
 // DevTools, zoom, full screen, edit commands) and each acts on the *focused*
 // webContents — including a BrowserView panel — matching native menu behaviour.
 function buildWindowsAppMenu(): Menu {
-	return Menu.buildFromTemplate([
-		{
-			label: "Edit",
-			submenu: [
-				{ role: "undo" },
-				{ role: "redo" },
-				{ type: "separator" },
-				{ role: "cut" },
-				{ role: "copy" },
-				{ role: "paste" },
-				{ role: "selectAll" },
-			],
-		},
-		{
-			label: "View",
-			submenu: [
-				{ role: "reload" },
-				{ role: "toggleDevTools" },
-				{ type: "separator" },
-				{ role: "resetZoom" },
-				{ role: "zoomIn" },
-				{ role: "zoomOut" },
-				{ type: "separator" },
-				{ role: "togglefullscreen" },
-			],
-		},
-		{
-			label: "Window",
-			submenu: [{ role: "minimize" }, { role: "close" }],
-		},
-	]);
+	return Menu.buildFromTemplate(buildWindowsAppMenuTemplate());
 }
 
 function createWindow(): void {
@@ -1454,6 +1426,11 @@ ipcMain.handle("updates:check", async (_event, options?: UpdateCheckOptions) => 
 	const runFile = runFilePath();
 	if (!runFile) return;
 	await checkForUpdatesNow(path.dirname(runFile), options);
+});
+ipcMain.handle("updates:returnHome", async (_event, requestId?: string) => {
+	const runFile = runFilePath();
+	if (!runFile) return;
+	await returnToHome(path.dirname(runFile), requestId);
 });
 ipcMain.handle("updates:download", async (_event, requestId?: string) => {
 	await downloadUpdateNow(requestId);
