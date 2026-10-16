@@ -1,14 +1,23 @@
 import { describe, expect, it } from "vitest";
+import { PostHog } from "posthog-js/dist/module.full.no-external";
 import {
+	automationPromptLengthBucket,
+	buildPostHogConfig,
 	buildTelemetryContext,
+	isDeniedEvent,
+	postHogEventName,
 	reserveCapture,
 	reserveDailyActiveCapture,
+	reserveRouteViewCapture,
 	routeSurface,
 	sanitizePostHogEvent,
 	sanitizeReplayRequestName,
 	sanitizeRendererExceptionProperties,
 	sanitizeRendererProperties,
 	startDailyActiveHeartbeat,
+	withTelemetryContext,
+	releaseChannelFrom,
+	versionChannelFrom,
 } from "./telemetry";
 import { ORCHESTRATOR_SPAWN_SOURCES } from "./orchestrator-spawn-sources";
 
@@ -23,16 +32,252 @@ function memoryStorage(initial: Record<string, string> = {}) {
 }
 
 describe("telemetry sanitizers", () => {
+	it("allows only the fixed session management summary schema", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.session_management_summary", {
+			measurement_schema_version: 1,
+			window_id: "123e4567-e89b-12d3-a456-426614174000",
+			worker_active_seconds: 42,
+			manual_worker_open_count: 3,
+			flush_reason: "interval",
+			session_id: "must-not-leave",
+		});
+		expect(safe).toEqual({
+			measurement_schema_version: 1,
+			window_id: "123e4567-e89b-12d3-a456-426614174000",
+			worker_active_seconds: 42,
+			manual_worker_open_count: 3,
+			flush_reason: "interval",
+		});
+	});
+
+	it("exports the session management summary under the v2 name", () => {
+		expect(postHogEventName("ao.renderer.session_management_summary")).toBe(
+			"ao.v2.renderer.session_management_summary",
+		);
+	});
+
+	it("isolates anonymous AO installation identity from persisted PostHog person state", () => {
+		const config = buildPostHogConfig("ins_stable-install-id");
+
+		expect(config.persistence).toBe("memory");
+		expect(config.person_profiles).toBe("never");
+		expect(config.autocapture).toBe(false);
+		expect(config.capture_performance).toBe(false);
+		expect(config.disable_session_recording).toBe(true);
+		expect(config.bootstrap).toEqual({
+			distinctID: "ins_stable-install-id",
+			isIdentifiedID: false,
+		});
+	});
+
+	// The daemon enforces the same list on its own sink, but renderer events go
+	// straight to PostHog, so the policy has to be honoured here too or the kill
+	// switch only covers half the producers.
+	it("honours the supervisor deny list, by either internal or exported name", () => {
+		expect(isDeniedEvent("ao.app.active", ["ao.v2.app.active"])).toBe(true);
+		expect(isDeniedEvent("ao.app.active", ["ao.app.active"])).toBe(true);
+		expect(isDeniedEvent("ao.app.active", ["  AO.V2.APP.ACTIVE  "])).toBe(true);
+		expect(isDeniedEvent("ao.renderer.route_viewed", ["ao.renderer.*"])).toBe(true);
+		expect(isDeniedEvent("$exception", ["$exception"])).toBe(true);
+
+		expect(isDeniedEvent("ao.session.spawned", ["ao.renderer.*"])).toBe(false);
+		expect(isDeniedEvent("ao.app.active", [])).toBe(false);
+		// A bare "*" must not silence everything by accident.
+		expect(isDeniedEvent("ao.app.active", ["", "  ", "*"])).toBe(false);
+	});
+
+	it("allowlists only counts and the fixed agent-id list on agent inventory", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.agents_available", {
+			installed_count: 2,
+			authorized_count: 1,
+			supported_count: 23,
+			authorized_agents: "claude-code,codex",
+			// Must be dropped: never part of the contract, and a future caller could
+			// pass a path or a label by mistake.
+			binary_path: "/Users/someone/.local/bin/codex",
+			label: "Codex (someone's machine)",
+		});
+		expect(safe).toEqual({
+			installed_count: 2,
+			authorized_count: 1,
+			supported_count: 23,
+			authorized_agents: "claude-code,codex",
+		});
+	});
+
+	it("allowlists only enum-like fields on update events", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.update_failed", {
+			to_version: "0.11.2",
+			error_category: "network",
+			phase: "download",
+			trigger: "automatic",
+			// Must be dropped: raw updater text can carry feed URLs and local paths.
+			message: "EACCES /Users/someone/Library/Caches/ao-updater",
+			stack: "at Object.<anonymous>",
+		});
+		expect(safe).toEqual({
+			to_version: "0.11.2",
+			error_category: "network",
+			phase: "download",
+			trigger: "automatic",
+		});
+
+		// An unrecognized phase is not passed through as-is.
+		const bogus = await sanitizeRendererProperties("ao.renderer.update_failed", { phase: "sideload" });
+		expect(bogus.phase).toBeUndefined();
+	});
+
+	it("retains bounded update transfer observations and drops untrusted values", async () => {
+		const observation = {
+			differential_eligible: true, transfer_mode: "differential", fallback: true,
+			transferred_bytes: 12345, target_bytes: 99999,
+		};
+		expect(await sanitizeRendererProperties("ao.renderer.update_downloaded", observation)).toEqual(observation);
+		expect(await sanitizeRendererProperties("ao.renderer.update_failed", {
+			differential_eligible: "true", transfer_mode: "https://secret", fallback: 1,
+			transferred_bytes: -1, target_bytes: Infinity, url: "https://secret",
+		})).toEqual({});
+	});
+
+	it("reports a support submission with only the destination and outcome", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.support_submitted", {
+			destination: "discord",
+			outcome: "succeeded",
+			// Everything the dialog collects is passed in deliberately: the user's own
+			// bug report, and the diagnostics block that carries machine state.
+			summary: "crashes when I open my repo",
+			details: "stack trace from /Users/me/work/secret-client",
+			diagnostics: { platform: "darwin", appVersion: "0.11.2" },
+		});
+		expect(safe).toEqual({ destination: "discord", outcome: "succeeded" });
+	});
+
+	it("drops an unrecognised support destination rather than forwarding it", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.support_submitted", {
+			destination: "mailto:founder@example.com",
+			outcome: "failed",
+		});
+		expect(safe).toEqual({ outcome: "failed" });
+	});
+
+	it("reports the support open with no properties at all", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.support_opened", {
+			summary: "everything is broken",
+		});
+		expect(safe).toEqual({});
+	});
+
+	it("reports the session auto-review switch with only its direction", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.review_auto_review_toggled", {
+			enabled: true,
+			// Must be dropped: the session's id and the title the user typed.
+			session_id: "sess-1",
+			session_name: "fix the login bug",
+		});
+		expect(safe).toEqual({ enabled: true });
+	});
+
+	it("reports the mobile connect open with only the bridge state", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.mobile_connect_opened", {
+			bridge_enabled: true,
+			// Everything the QR encodes is in scope for leaking here, so it is all
+			// passed in deliberately and must all be dropped.
+			host: "192.168.1.20",
+			port: 3011,
+			password: "hunter2secret",
+		});
+		expect(safe).toEqual({ bridge_enabled: true });
+	});
+
+	it("reports the bridge toggle without the pairing payload", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.mobile_bridge_toggled", {
+			enabled: true,
+			outcome: "succeeded",
+			password: "hunter2secret",
+			host: "192.168.1.20",
+		});
+		expect(safe).toEqual({ enabled: true, outcome: "succeeded" });
+	});
+
+	it("drops an unrecognised toggle outcome rather than forwarding it", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.mobile_bridge_toggled", {
+			enabled: false,
+			outcome: "kind-of-worked",
+		});
+		expect(safe).toEqual({ enabled: false });
+	});
+
+	it("disables every billable PostHog product AO does not consume", () => {
+		const config = buildPostHogConfig("ins_stable-install-id");
+
+		// Replay is billed per recording, so it escapes the per-name rate limits
+		// in this module entirely. Disabling it client-side means the project-side
+		// toggle cannot switch it back on for shipped builds.
+		expect(config.disable_session_recording).toBe(true);
+		// AO reads no flags and ships no surveys, and /flags requests are billed
+		// per request, so any request here is cost for data nothing reads.
+		expect(config.advanced_disable_flags).toBe(true);
+		expect(config.disable_surveys).toBe(true);
+		// Already-disabled capture paths that would otherwise autocapture volume.
+		expect(config.autocapture).toBe(false);
+		expect(config.capture_pageview).toBe(false);
+		expect(config.capture_exceptions).toBe(false);
+		expect(config.capture_performance).toBe(false);
+	});
+
+	it("emits the stable AO installation id without creating a person profile", () => {
+		const client = new PostHog();
+		client.init("phc_test", {
+			...buildPostHogConfig("ins_stable-install-id"),
+			advanced_disable_decide: true,
+			advanced_disable_flags: true,
+			disable_session_recording: true,
+			disable_surveys: true,
+		});
+		try {
+			const captured = client.capture("ao.app.active", { channel: "renderer" });
+
+			expect(captured?.properties).toMatchObject({
+				distinct_id: "ins_stable-install-id",
+				$device_id: "ins_stable-install-id",
+				$is_identified: false,
+				$process_person_profile: false,
+			});
+		} finally {
+			const queue = client._requestQueue as unknown as
+				{ _queue: unknown[]; _clearFlushTimeout: () => void } | undefined;
+			if (queue) {
+				queue._queue.length = 0;
+				queue._clearFlushTimeout();
+			}
+		}
+	});
+
 	it("builds stable AO version context for PostHog events", () => {
 		expect(buildTelemetryContext(" 1.2.3-nightly.20260707 ", "linux")).toMatchObject({
 			app_version: "1.2.3-nightly.20260707",
 			ao_version: "1.2.3-nightly.20260707",
 			platform: "linux",
+			telemetry_schema_version: 2,
 		});
 		expect(buildTelemetryContext("", "darwin")).toMatchObject({
 			app_version: "unknown",
 			ao_version: "unknown",
 			platform: "darwin",
+			telemetry_schema_version: 2,
+		});
+	});
+
+	it("uses v2 PostHog event names for streams that have noisy legacy producers", () => {
+		expect(postHogEventName("ao.app.active")).toBe("ao.v2.app.active");
+		expect(postHogEventName("ao.renderer.route_viewed")).toBe("ao.v2.renderer.route_viewed");
+		expect(postHogEventName("ao.renderer.api_error")).toBe("ao.v2.renderer.api_error");
+		expect(postHogEventName("ao.session.spawned")).toBe("ao.session.spawned");
+	});
+
+	it("forces renderer events to stay anonymous in PostHog", () => {
+		expect(withTelemetryContext({ $process_person_profile: true })).toMatchObject({
+			$process_person_profile: false,
 		});
 	});
 
@@ -42,6 +287,46 @@ describe("telemetry sanitizers", () => {
 		expect(routeSurface("/projects/demo")).toBe("project_board");
 		expect(routeSurface("/projects/demo/settings")).toBe("project_settings");
 		expect(routeSurface("/projects/demo/sessions/demo-1")).toBe("session_detail");
+		expect(routeSurface("/automations")).toBe("automations");
+		expect(routeSurface("/automations/demo-automation")).toBe("automations");
+		expect(routeSurface("/artifacts")).toBe("artifacts");
+	});
+
+	it("keeps automation funnel events free of prompt text and raw ids", async () => {
+		const props = await sanitizeRendererProperties("ao.renderer.automation_create_succeeded", {
+			project_id: "demo-project",
+			schedule_preset: "weekly",
+			prompt_length_bucket: "m",
+			prompt: "review the nightly CI failures in acme/private-repo",
+			display_name: "Nightly CI triage",
+		});
+
+		expect(Object.keys(props).sort()).toEqual(["project_id_hash", "prompt_length_bucket", "schedule_preset"]);
+		expect(props.schedule_preset).toBe("weekly");
+		expect(props.prompt_length_bucket).toBe("m");
+		expect(props.project_id_hash).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("drops automation funnel values outside the closed vocabularies", async () => {
+		expect(
+			await sanitizeRendererProperties("ao.renderer.automation_create_requested", {
+				schedule_preset: "FREQ=WEEKLY;BYDAY=MO;BYHOUR=9",
+				prompt_length_bucket: "4096",
+			}),
+		).toEqual({});
+		expect(await sanitizeRendererProperties("ao.renderer.automation_create_opened", { project_id: "demo-project" })).toEqual({});
+	});
+
+	it("bands prompt length in the bytes the daemon counts", () => {
+		expect(automationPromptLengthBucket("")).toBe("xs");
+		expect(automationPromptLengthBucket("a".repeat(80))).toBe("xs");
+		expect(automationPromptLengthBucket("a".repeat(81))).toBe("s");
+		expect(automationPromptLengthBucket("a".repeat(240))).toBe("s");
+		expect(automationPromptLengthBucket("a".repeat(800))).toBe("m");
+		expect(automationPromptLengthBucket("a".repeat(2000))).toBe("l");
+		expect(automationPromptLengthBucket("a".repeat(2001))).toBe("xl");
+		// Three bytes per character, so 27 of them outrank 27 ASCII ones.
+		expect(automationPromptLengthBucket("每天检查持续集成失败并提交修复".repeat(2))).toBe("s");
 	});
 
 	it("hashes renderer ids and drops raw route identifiers", async () => {
@@ -187,6 +472,18 @@ describe("telemetry sanitizers", () => {
 		}
 	});
 
+	it("keeps only the scope enum on artifact_create events", async () => {
+		for (const event of [
+			"ao.renderer.artifact_create_requested",
+			"ao.renderer.artifact_create_succeeded",
+			"ao.renderer.artifact_create_failed",
+		]) {
+			expect(await sanitizeRendererProperties(event, { scope: "project", project_id: "demo-project", name: "plan.md" })).toEqual({ scope: "project" });
+			expect(await sanitizeRendererProperties(event, { scope: "standalone" })).toEqual({ scope: "standalone" });
+			expect(await sanitizeRendererProperties(event, { scope: "/Users/alice/secret" })).toEqual({});
+		}
+	});
+
 	it("keeps only the source enum on orchestrator_spawn events", async () => {
 		const props = await sanitizeRendererProperties("ao.renderer.orchestrator_spawn_requested", {
 			project_id: "demo-project",
@@ -230,6 +527,46 @@ describe("telemetry sanitizers", () => {
 		expect(
 			await sanitizeRendererProperties("ao.renderer.notification_mark_read_requested", { scope: "everything" }),
 		).toEqual({});
+	});
+
+	it("keeps a hashed project id, shared editor id, and target kind on open_in_editor_requested", async () => {
+		const props = await sanitizeRendererProperties("ao.renderer.open_in_editor_requested", {
+			project_id: "demo-project",
+			editor_id: "vscode",
+			target_kind: "editor",
+		});
+		expect(Object.keys(props).sort()).toEqual(["editor_id", "project_id_hash", "target_kind"]);
+		expect(props.editor_id).toBe("vscode");
+		expect(props.target_kind).toBe("editor");
+
+		const bogus = await sanitizeRendererProperties("ao.renderer.open_in_editor_requested", {
+			project_id: "demo-project",
+			// Not a real editor id — must not be forwarded as-is.
+			editor_id: "/Users/alice/bin/notepad",
+			target_kind: "everything",
+		});
+		expect(bogus).not.toHaveProperty("editor_id");
+		expect(bogus).not.toHaveProperty("target_kind");
+	});
+
+	it("keeps the editor id and target kind on open_in_editor_succeeded", async () => {
+		const props = await sanitizeRendererProperties("ao.renderer.open_in_editor_succeeded", {
+			project_id: "demo-project",
+			editor_id: "cursor",
+			target_kind: "editor",
+		});
+		expect(Object.keys(props).sort()).toEqual(["editor_id", "project_id_hash", "target_kind"]);
+		expect(props.editor_id).toBe("cursor");
+		expect(props.target_kind).toBe("editor");
+	});
+
+	it("reports open_in_editor_failed with only the hashed project id", async () => {
+		const props = await sanitizeRendererProperties("ao.renderer.open_in_editor_failed", {
+			project_id: "demo-project",
+			// Never part of the contract; must not leak through.
+			error: "EDITOR_LAUNCH_FAILED: Could not launch VS Code",
+		});
+		expect(Object.keys(props)).toEqual(["project_id_hash"]);
 	});
 
 	it("whitelists coarse daemon failure fields and drops messages", async () => {
@@ -312,15 +649,88 @@ describe("reserveCapture", () => {
 });
 
 describe("daily active heartbeat", () => {
-	it("reserves one active capture per UTC date", () => {
-		const storage = memoryStorage();
+	it("derives the running channel from the version string", () => {
+		expect(versionChannelFrom("0.11.3")).toBe("stable");
+		expect(versionChannelFrom("0.11.3-nightly.5")).toBe("nightly");
+		expect(versionChannelFrom("0.12.0-NIGHTLY.1")).toBe("nightly");
+		// A pinned feature build is not nightly, and an absent version is unknown.
+		expect(versionChannelFrom("0.11.3-feature.42")).toBe("stable");
+		expect(versionChannelFrom("")).toBe("unknown");
+		expect(versionChannelFrom("unknown")).toBe("unknown");
+	});
 
-		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T23:59:00.000Z"))).toBe(true);
+	it("classifies the desktop app with client=desktop on every event", () => {
+		const ctx = buildTelemetryContext("0.11.3", "darwin", "stable");
+		expect(ctx.client).toBe("desktop");
+	});
+
+	it("carries intent and reality as separate context properties", () => {
+		const ctx = buildTelemetryContext("0.11.3", "darwin", "nightly");
+		// opted into nightly, still running a stable binary: the gap is the signal.
+		expect(ctx.release_channel).toBe("nightly");
+		expect(ctx.version_channel).toBe("stable");
+	});
+
+	it("maps the Updates setting to a release channel, not the version string", () => {
+		expect(releaseChannelFrom({ channel: "latest", feature: null })).toBe("stable");
+		expect(releaseChannelFrom({ channel: "nightly", feature: null })).toBe("nightly");
+		// A pinned feature build wins regardless of the underlying channel, which
+		// is what version-string parsing got wrong.
+		expect(releaseChannelFrom({ channel: "latest", feature: 1234 })).toBe("feature");
+		expect(releaseChannelFrom({ channel: "nightly", feature: 1234 })).toBe("feature");
+		expect(releaseChannelFrom(null)).toBe("unknown");
+		expect(releaseChannelFrom({})).toBe("unknown");
+	});
+
+	it("reports only the two channel names on a switch", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.update_channel_changed", {
+			from_channel: "stable",
+			to_channel: "nightly",
+			feature: 1234,
+			branch: "feat/secret-thing",
+		});
+		expect(safe).toEqual({ from_channel: "stable", to_channel: "nightly" });
+	});
+
+	it("drops an unrecognised channel value", async () => {
+		const safe = await sanitizeRendererProperties("ao.renderer.update_channel_changed", {
+			from_channel: "canary",
+			to_channel: "nightly",
+		});
+		expect(safe).toEqual({ to_channel: "nightly" });
+	});
+
+	it("reserves one active capture per UTC day, not per six-hour slot", () => {
+		const storage = memoryStorage();
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T00:05:00.000Z"))).toBe(true);
+		// Every later hour of the same UTC day is refused. Under the old
+		// six-hour slotting, 06:00, 12:00 and 18:00 each reserved again, so one
+		// install could report four times a day.
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T05:59:59.000Z"))).toBe(false);
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T06:00:00.000Z"))).toBe(false);
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T12:00:00.000Z"))).toBe(false);
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T18:00:00.000Z"))).toBe(false);
 		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T23:59:59.000Z"))).toBe(false);
 		expect(reserveDailyActiveCapture(storage, new Date("2026-07-13T00:00:00.000Z"))).toBe(true);
 	});
 
-	it("emits at startup and then only after a later UTC date is observed on user activity", () => {
+	it("treats a slot record left by an older build as today already reported", () => {
+		// The upgrade path: a build that emitted per slot wrote { date, slots }.
+		// Reading it must not hand out a fresh reservation for the same day.
+		const storage = memoryStorage();
+		storage.setItem("ao.telemetry.activeSlotsByDate", JSON.stringify({ date: "2026-07-12", slots: [0] }));
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-12T14:00:00.000Z"))).toBe(false);
+		expect(reserveDailyActiveCapture(storage, new Date("2026-07-13T00:00:00.000Z"))).toBe(true);
+	});
+
+	it("reserves once per day without storage, so a private-mode window still reports once", () => {
+		expect(reserveDailyActiveCapture(undefined, new Date("2026-07-12T01:00:00.000Z"))).toBe(true);
+		expect(reserveDailyActiveCapture(undefined, new Date("2026-07-12T19:00:00.000Z"))).toBe(false);
+		expect(reserveDailyActiveCapture(undefined, new Date("2026-07-13T01:00:00.000Z"))).toBe(true);
+	});
+
+
+	it("emits once at startup and stays silent for the rest of the UTC day", () => {
 		const storage = memoryStorage();
 		const captured: string[] = [];
 		let now = new Date("2026-07-12T08:00:00.000Z");
@@ -328,7 +738,9 @@ describe("daily active heartbeat", () => {
 		const stop = startDailyActiveHeartbeat({
 			storage,
 			now: () => now,
-			capture: () => captured.push(now.toISOString()),
+			capture: () => {
+				captured.push(now.toISOString());
+			},
 			window,
 			document,
 		});
@@ -339,11 +751,57 @@ describe("daily active heartbeat", () => {
 			document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
 			expect(captured).toHaveLength(1);
 
+			// Later the same day, focus no longer produces a second event. This is
+			// the four-per-day reduction, and it is the whole point of the change.
+			now = new Date("2026-07-12T12:00:00.000Z");
+			window.dispatchEvent(new Event("focus"));
+			now = new Date("2026-07-12T20:00:00.000Z");
+			window.dispatchEvent(new Event("focus"));
+			expect(captured).toEqual(["2026-07-12T08:00:00.000Z"]);
+
+			// The next UTC day reports again.
 			now = new Date("2026-07-13T09:00:00.000Z");
 			window.dispatchEvent(new Event("focus"));
 			expect(captured).toEqual(["2026-07-12T08:00:00.000Z", "2026-07-13T09:00:00.000Z"]);
 		} finally {
 			stop();
 		}
+	});
+
+	it("retries the same UTC day when PostHog rejects the first capture", async () => {
+		const storage = memoryStorage();
+		let attempts = 0;
+		const dayTime = new Date("2026-07-23T08:00:00.000Z");
+		const stop = startDailyActiveHeartbeat({
+			storage,
+			now: () => dayTime,
+			capture: () => {
+				attempts += 1;
+				return attempts > 1;
+			},
+			window,
+			document,
+		});
+		try {
+			await Promise.resolve();
+			window.dispatchEvent(new Event("focus"));
+			await Promise.resolve();
+
+			expect(attempts).toBe(2);
+			expect(reserveDailyActiveCapture(storage, new Date("2026-07-23T09:00:00.000Z"))).toBe(false);
+		} finally {
+			stop();
+		}
+	});
+});
+
+describe("route view reservation", () => {
+	it("reserves one capture per surface per UTC date", () => {
+		const storage = memoryStorage();
+
+		expect(reserveRouteViewCapture(storage, "session_detail", new Date("2026-07-12T08:00:00.000Z"))).toBe(true);
+		expect(reserveRouteViewCapture(storage, "session_detail", new Date("2026-07-12T09:00:00.000Z"))).toBe(false);
+		expect(reserveRouteViewCapture(storage, "project_board", new Date("2026-07-12T09:00:00.000Z"))).toBe(true);
+		expect(reserveRouteViewCapture(storage, "session_detail", new Date("2026-07-13T00:00:00.000Z"))).toBe(true);
 	});
 });

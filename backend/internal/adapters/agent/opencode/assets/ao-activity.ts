@@ -1,16 +1,19 @@
 // agent-orchestrator: managed opencode activity plugin (do not edit)
 //
-// It maps opencode's native lifecycle events onto AO's three normalized
+// It maps opencode's native lifecycle events onto AO's normalized
 // activity events:
 //   session.created                       -> `ao hooks opencode session-start`
 //   message.updated / message.part.updated -> `ao hooks opencode user-prompt-submit`
+//   tool.execute.before / tool.execute.after -> `ao hooks opencode active`
 //   session.status (status.type == idle)   -> `ao hooks opencode stop`
+//   permission.asked / question.asked      -> `ao hooks opencode permission-blocked`
+//   permission/question reply or rejection -> `ao hooks opencode active`
 //
 // The opencode-native session id (and prompt/model where known) is piped to the
 // hook command as JSON on stdin, run with cwd set to the worktree so AO can
 // correlate the opencode session to its AO session. Every invocation is
 // best-effort and must never crash the user's opencode session: a missing `ao`
-// binary is a guarded no-op (`command -v ao`), and spawn exceptions, non-zero
+// binary is a guarded no-op (`Bun.which`), and spawn exceptions, non-zero
 // exit codes, and malformed event payloads are caught and surfaced through
 // opencode's structured logger (client.app.log) for diagnosis — never rethrown.
 //
@@ -30,12 +33,17 @@ export const aoActivity: Plugin = async ({ directory, client }) => {
   let currentSessionID: string | null = null
   // The model of the most recent assistant message, forwarded for context.
   let currentModel: string | null = null
+  // AO fences each provider generation with AO_RUNTIME_LAUNCH_ID; carry it in
+  // the payload so hooks work even when child-process env inheritance is
+  // trimmed by the host runtime.
+  const launchID: string = (process.env.AO_RUNTIME_LAUNCH_ID ?? "").trim()
   const messageStore = new Map<string, any>()
 
-  // Wrap in `sh -c` with a guard so a missing `ao` binary is a silent no-op
-  // (exit 0) rather than a per-event error in the user's session.
-  function hookCmd(hookName: string): string[] {
-    return ["sh", "-c", `if ! command -v ao >/dev/null 2>&1; then exit 0; fi; exec ao hooks opencode ${hookName}`]
+  // Resolve AO through Bun so the same command works on Unix and Windows. A
+  // missing binary remains a silent no-op rather than a per-event error.
+  function hookCmd(hookName: string): string[] | null {
+    const ao = Bun.which("ao")
+    return ao ? [ao, "hooks", "opencode", hookName] : null
   }
 
   // Report a hook failure through opencode's structured logger. Best-effort: the
@@ -66,9 +74,12 @@ export const aoActivity: Plugin = async ({ directory, client }) => {
   // rethrown, so reporting failures are diagnosable without crashing opencode.
   function callHookSync(hookName: string, payload: Record<string, unknown>) {
     try {
-      const result = Bun.spawnSync(hookCmd(hookName), {
+      const command = hookCmd(hookName)
+      if (!command) return
+      const result = Bun.spawnSync(command, {
         cwd: directory,
-        stdin: new TextEncoder().encode(JSON.stringify(payload) + "\n"),
+        env: { ...process.env, AO_RUNTIME_LAUNCH_ID: launchID },
+        stdin: new TextEncoder().encode(JSON.stringify({ ...payload, launch_id: launchID }) + "\n"),
         stdout: "ignore",
         stderr: "pipe",
         timeout: HOOK_TIMEOUT_MS,
@@ -78,7 +89,7 @@ export const aoActivity: Plugin = async ({ directory, client }) => {
         logHookFailure(hookName, `exited ${result.exitCode}${stderr ? `: ${stderr}` : ""}`)
       }
     } catch (err) {
-      // The spawn itself failed (e.g. no `sh` on PATH). Never propagate.
+      // The spawn itself failed. Never propagate.
       logHookFailure(hookName, err instanceof Error ? err.message : String(err))
     }
   }
@@ -163,12 +174,38 @@ export const aoActivity: Plugin = async ({ directory, client }) => {
             callHookSync("stop", { session_id: sessionID, model: currentModel ?? "" })
             break
           }
+
+          case "permission.asked":
+          case "question.asked": {
+            const sessionID = (event as any).properties?.sessionID ?? currentSessionID
+            if (!sessionID) break
+            callHookSync("permission-blocked", { session_id: sessionID, model: currentModel ?? "" })
+            break
+          }
+
+          case "permission.replied":
+          case "question.replied":
+          case "question.rejected": {
+            const sessionID = (event as any).properties?.sessionID ?? currentSessionID
+            if (!sessionID) break
+            callHookSync("active", { session_id: sessionID, model: currentModel ?? "" })
+            break
+          }
+
         }
       } catch (err) {
         // A malformed/unexpected event payload must never crash opencode; log
         // it (tagged with the event type) for diagnosis and move on.
         logHookFailure(`event:${(event as any)?.type ?? "unknown"}`, err instanceof Error ? err.message : String(err))
       }
+    },
+    "tool.execute.before": async (input) => {
+      callHookSync("active", { session_id: input.sessionID, model: currentModel ?? "" })
+    },
+    "tool.execute.after": async (input) => {
+      // Tool completion is still activity; session.status(idle) owns the
+      // transition back to idle after the turn finishes.
+      callHookSync("active", { session_id: input.sessionID, model: currentModel ?? "" })
     },
   }
 }

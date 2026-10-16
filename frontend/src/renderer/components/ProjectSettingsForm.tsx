@@ -1,562 +1,396 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { TriangleAlert } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
+import { useEffect, useRef } from "react";
 import type { components } from "../../api/schema";
-import { agentsQueryKey, agentsQueryOptions, refreshAgents } from "../hooks/useAgentsQuery";
-import { useWorkspaceQuery, workspaceQueryKey } from "../hooks/useWorkspaceQuery";
+import { useAgentReadinessQuery, useEnsureAgentReadiness } from "../hooks/useAgentReadinessQuery";
+import { useRemoteProjectQuery, workspaceQueryKeyForHost, workspaceQueryOptions } from "../hooks/useWorkspaceQuery";
+import { useSettings } from "../hooks/useSettings";
+import { useConnectedHosts } from "../hooks/useHostConnection";
 import { apiClient, apiErrorMessage } from "../lib/api-client";
+import { clientForHost } from "../lib/host-clients";
+import { LOCAL_HOST, refKey } from "../lib/hosts";
+import { isLaunchableAgent } from "../lib/agent-select-options";
+import { WORKER_DEFAULT_REVIEWERS } from "../lib/reviewer-harnesses";
+import { captureOrchestratorReplacementFailure } from "../lib/orchestrator-replacement-telemetry";
+import { OrchestratorSpawnError, spawnOrchestrator } from "../lib/spawn-orchestrator";
+import { openRemoteOrchestrator } from "../lib/remote-orchestrator";
 import { captureRendererEvent } from "../lib/telemetry";
-import { spawnOrchestrator } from "../lib/spawn-orchestrator";
+import { type OrchestratorReplacementFailure, useUiStore } from "../stores/ui-store";
 import { newestActiveOrchestrator } from "../types/workspace";
 import { RequiredAgentField } from "./CreateProjectAgentSheet";
-import { DashboardSubhead } from "./DashboardSubhead";
-import { buildIntake, deriveGitHubRepo, IntakeFields, type IntakeForm, intakeNeedsRule } from "./IntakeFields";
-import { Button } from "./ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
-import { Label } from "./ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import { buildIntake } from "./IntakeFields";
+import { ReviewerSelect, reviewerTrustWarning } from "./ReviewerSelect";
+import { ProjectSettingsEditor, type ProjectAgentPickerProps, type ProjectSettingsDraft } from "./ProjectSettingsEditor";
+import { CloudProjectSettingsAdapter } from "./CloudProjectSettingsForm";
 
 type Project = components["schemas"]["Project"];
 type ProjectConfig = components["schemas"]["ProjectConfig"];
 type TrackerIntakeConfig = components["schemas"]["TrackerIntakeConfig"];
 
-const PERMISSION_MODE_OPTIONS = [
-	{ value: "default", label: "Default" },
-	{ value: "accept-edits", label: "Accept edits" },
-	{ value: "auto", label: "Auto" },
-	{ value: "bypass-permissions", label: "Bypass permissions" },
-] as const;
+const DEFAULT_BRANCH_AUTO = "auto";
 
-const KNOWN_REVIEWER_HARNESS_IDS = new Set(["claude-code", "codex", "opencode"]);
+const projectQueryKey = (id: string, hostId?: string) => hostId ? ["project", hostId, id] as const : ["project", id] as const;
 
-const projectQueryKey = (id: string) => ["project", id] as const;
+type SettingsSaveResult = {
+	savedKey: string;
+	replacementError: string | null;
+	replacementSessionId: string | null;
+	replacementFailure: OrchestratorReplacementFailure | null;
+	spawnError: unknown;
+};
 
-export function ProjectSettingsForm({ projectId }: { projectId: string }) {
+export type ProjectSettingsSection = "general" | "agents";
+export type ProjectSettingsSaveState = {
+	phase: "idle" | "pending" | "saving" | "saved" | "failed";
+	dirty?: boolean;
+	requestPending?: boolean;
+	error?: string;
+	replacementError?: string;
+	/** The draft is dirty but cannot be saved as it stands (e.g. an invalid name). */
+	unsaveable?: boolean;
+	retry?: () => void;
+};
+
+type ProjectSettingsFormProps = {
+	projectId: string;
+	/** Installation ID of the self-hosted daemon that owns this project. */
+	hostId?: string;
+	cloudOrgId?: string;
+	section?: ProjectSettingsSection;
+	onSaveState?: (state: ProjectSettingsSaveState) => void;
+};
+
+export function ProjectSettingsForm(props: ProjectSettingsFormProps) {
+	return props.cloudOrgId !== undefined
+		? <CloudProjectSettingsAdapter {...props} cloudOrgId={props.cloudOrgId} />
+		: <LocalProjectSettingsAdapter {...props} />;
+}
+
+function LocalProjectSettingsAdapter({
+	projectId,
+	hostId,
+	section = "general",
+	onSaveState,
+}: ProjectSettingsFormProps) {
+	const { t } = useTranslation();
 	const queryClient = useQueryClient();
+	const connected = useConnectedHosts();
+	const hostConnected = !hostId || connected.includes(hostId);
+	useEffect(() => {
+		if (!hostConnected) onSaveState?.({ phase: "idle" });
+	}, [hostConnected, onSaveState]);
 
 	const query = useQuery({
-		queryKey: projectQueryKey(projectId),
+		queryKey: projectQueryKey(projectId, hostId),
+		enabled: hostConnected,
 		queryFn: async () => {
-			const { data, error } = await apiClient.GET("/api/v1/projects/{id}", {
+			const { data, error } = await (hostId ? clientForHost(hostId) : apiClient).GET("/api/v1/projects/{id}", {
 				params: { path: { id: projectId } },
 			});
 			if (error) throw new Error(apiErrorMessage(error));
-			if (data?.status !== "ok") throw new Error("Project config is unavailable (degraded).");
+			if (data?.status !== "ok") throw new Error(t("settings.project.degraded"));
 			return data.project as Project;
 		},
 	});
 
-	if (query.isLoading) {
-		return <CenteredNote>Loading project settings…</CenteredNote>;
-	}
-	if (query.isError || !query.data) {
-		return (
-			<CenteredNote>{query.error instanceof Error ? query.error.message : "Could not load project."}</CenteredNote>
-		);
-	}
-
 	return (
-		<div className="flex h-full min-h-0 flex-col bg-background text-foreground">
-			<DashboardSubhead title="Settings" subtitle={query.data.path} />
-			<div className="min-h-0 flex-1 overflow-y-auto p-4.5">
+		<>
+			{!hostConnected ? <p role="alert" className="text-pretty text-sm text-error">{t("remote.hostOffline")}</p> : null}
+			{!query.data && hostConnected && query.isLoading ? (
+				<p className="text-sm text-settings-muted">{t("settings.project.loading")}</p>
+			) : !query.data && hostConnected ? (
+				<p className="text-sm text-error">{query.error instanceof Error ? query.error.message : t("settings.project.loadFailed")}</p>
+			) : query.data ? (
+				<div hidden={!hostConnected}>
 				<SettingsBody
-					key={projectId}
+					key={refKey({ host: hostId ?? LOCAL_HOST, id: projectId })}
 					project={query.data}
-					onSaved={() => queryClient.invalidateQueries({ queryKey: workspaceQueryKey })}
+					onSaved={() =>
+						queryClient.invalidateQueries({ queryKey: workspaceQueryKeyForHost(hostId) }).catch(() => {
+							// Saving succeeds even if the cache refresh fails.
+						})
+					}
 					projectId={projectId}
+					hostId={hostId}
+					hostConnected={hostConnected}
+					section={section}
+					onSaveState={onSaveState}
 				/>
-			</div>
-		</div>
+				</div>
+			) : null}
+		</>
 	);
 }
 
-function SettingsBody({ project, projectId, onSaved }: { project: Project; projectId: string; onSaved: () => void }) {
+function SettingsBody({ project, projectId, hostId, hostConnected, onSaved, section = "general", onSaveState }: {
+	project: Project;
+	projectId: string;
+	hostId?: string;
+	hostConnected: boolean;
+	onSaved: () => Promise<void>;
+	section?: ProjectSettingsSection;
+	onSaveState?: (state: ProjectSettingsSaveState) => void;
+}) {
+	const { t } = useTranslation();
 	const queryClient = useQueryClient();
-	const workspaceQuery = useWorkspaceQuery();
+	const setOrchestratorReplacementError = useUiStore((state) => state.setOrchestratorReplacementError);
+	const workspaceQuery = useQuery({ ...workspaceQueryOptions, enabled: !hostId });
+	const remoteProjectQuery = useRemoteProjectQuery(hostId ?? "", projectId);
 	const config = project.config ?? {};
 	const isScratchProject = project.kind === "scratch";
-	const workspace = workspaceQuery.data?.find((item) => item.id === projectId);
+	const { settings } = useSettings(hostId);
+	const intakeVisible = !isScratchProject && !!settings?.trackerIntakeEnabled;
+	const workspace = hostId ? remoteProjectQuery.data : workspaceQuery.data?.find((item) => item.id === projectId);
 	const activeOrchestrator = newestActiveOrchestrator(workspace?.sessions ?? []);
 	const intake: TrackerIntakeConfig = config.trackerIntake ?? {};
-	const [form, setForm] = useState({
+	const initialValues: ProjectSettingsDraft = {
 		displayName: project.name,
-		defaultBranch: config.defaultBranch ?? project.defaultBranch ?? "",
+		defaultBranch: config.defaultBranch ?? DEFAULT_BRANCH_AUTO,
 		sessionPrefix: config.sessionPrefix ?? "",
 		workerAgent: config.worker?.agent ?? "",
 		orchestratorAgent: config.orchestrator?.agent ?? "",
-		model: config.agentConfig?.model ?? "",
-		permissions: config.agentConfig?.permissions ?? "",
+		workerModel: config.worker?.agentConfig?.model ?? config.agentConfig?.model ?? "",
+		workerEffort: config.worker?.agentConfig?.effort ?? config.agentConfig?.effort ?? "",
+		workerPermissions: config.worker?.agentConfig?.permissions ?? config.agentConfig?.permissions ?? "",
+		orchestratorModel: config.orchestrator?.agentConfig?.model ?? config.agentConfig?.model ?? "",
+		orchestratorEffort: config.orchestrator?.agentConfig?.effort ?? config.agentConfig?.effort ?? "",
+		orchestratorPermissions: config.orchestrator?.agentConfig?.permissions ?? config.agentConfig?.permissions ?? "",
+		workerMode: config.worker?.agentConfig?.mode ?? config.agentConfig?.mode ?? "",
+		orchestratorMode: config.orchestrator?.agentConfig?.mode ?? config.agentConfig?.mode ?? "",
 		reviewerHarness: config.reviewers?.[0]?.harness ?? "",
+		reviewerModel: config.reviewers?.[0]?.agentConfig?.model ?? config.agentConfig?.model ?? "",
+		reviewerMode: config.reviewers?.[0]?.agentConfig?.mode ?? config.agentConfig?.mode ?? "",
+		reviewerEffort: config.reviewers?.[0]?.agentConfig?.effort ?? config.agentConfig?.effort ?? "",
+		reviewerPermissions: config.reviewers?.[0]?.agentConfig?.permissions ?? config.agentConfig?.permissions ?? "",
+		autoReview: config.autoReview ?? false,
+		workersRequestReview: config.workersRequestReview ?? false,
 		intakeEnabled: intake.enabled ?? false,
 		intakeRepo: intake.repo ?? "",
 		intakeAssignee: intake.assignee ?? "",
-	});
-	const [savedAt, setSavedAt] = useState<number | null>(null);
-	const [replacementError, setReplacementError] = useState<string | null>(null);
-	const [validationError, setValidationError] = useState<string | null>(null);
-	const initialOrchestratorAgent = config.orchestrator?.agent ?? "";
-	const missingRequiredAgent = form.workerAgent === "" || form.orchestratorAgent === "";
-	const agentsQuery = useQuery(agentsQueryOptions);
-	const agentCatalog = agentsQuery.data;
-	const refreshAgentsMutation = useMutation({
-		mutationFn: refreshAgents,
-		onSuccess: (next) => queryClient.setQueryData(agentsQueryKey, next),
-	});
-
-	// Git projects can derive owner/repo from origin when trackerIntake.repo is unset.
-	// Scratch hides tracker intake entirely, so this display-only preview is only
-	// rendered for git-backed projects.
-	const intakeForm: IntakeForm = {
-		enabled: form.intakeEnabled,
-		repo: form.intakeRepo,
-		assignee: form.intakeAssignee,
 	};
-	const patchIntake = (patch: Partial<IntakeForm>) =>
-		setForm((f) => ({
-			...f,
-			intakeEnabled: patch.enabled ?? f.intakeEnabled,
-			intakeRepo: patch.repo ?? f.intakeRepo,
-			intakeAssignee: patch.assignee ?? f.intakeAssignee,
-		}));
-	const effectiveIntakeRepo = form.intakeRepo.trim() || deriveGitHubRepo(project.repo);
-	const intakeIncomplete = !isScratchProject && intakeNeedsRule(intakeForm);
-
-	const mutation = useMutation({
-		mutationFn: async () => {
-			void captureRendererEvent("ao.renderer.settings_save_requested", { project_id: projectId });
-			const displayName = form.displayName.trim();
-			// PUT replaces the whole config; merge the edited fields over what loaded
-			// so we don't drop env/symlinks/postCreate the form doesn't expose.
-			const next: ProjectConfig = isScratchProject
-				? {
-						...scratchSupportedConfig(config),
-						worker: { ...config.worker, agent: form.workerAgent },
-						orchestrator: { ...config.orchestrator, agent: form.orchestratorAgent },
-						agentConfig: blankToUndefined({
-							...config.agentConfig,
-							model: form.model || undefined,
-							permissions: form.permissions || undefined,
-						}),
-					}
-				: {
-						...config,
-						defaultBranch: form.defaultBranch || undefined,
-						sessionPrefix: form.sessionPrefix || undefined,
-						worker: { ...config.worker, agent: form.workerAgent },
-						orchestrator: { ...config.orchestrator, agent: form.orchestratorAgent },
-						agentConfig: blankToUndefined({
-							...config.agentConfig,
-							model: form.model || undefined,
-							permissions: form.permissions || undefined,
-						}),
-						reviewers: form.reviewerHarness ? [{ harness: form.reviewerHarness }] : undefined,
-						trackerIntake: buildIntake(intakeForm),
-					};
-			const { error } = await apiClient.PUT("/api/v1/projects/{id}", {
-				params: { path: { id: projectId } },
-				body: { displayName, config: next },
-			});
-			if (error) throw new Error(apiErrorMessage(error));
-			if (
-				form.orchestratorAgent !== initialOrchestratorAgent ||
-				(activeOrchestrator && activeOrchestrator.provider !== form.orchestratorAgent)
-			) {
-				try {
-					await spawnOrchestrator(projectId, "settings", true);
-				} catch (error) {
-					return {
-						replacementError: error instanceof Error ? error.message : "Could not replace orchestrator",
-					};
+	const lastOrchestratorRef = useRef(config.orchestrator?.agent ?? "");
+	const replacementAttemptedRef = useRef(false);
+	const replacementFailedRef = useRef(false);
+	const agentsQuery = useAgentReadinessQuery(true, hostId);
+	useEnsureAgentReadiness({ hostId });
+	const persist = async (values: ProjectSettingsDraft): Promise<SettingsSaveResult> => {
+		const savedKey = JSON.stringify(values);
+		void captureRendererEvent("ao.renderer.settings_save_requested", {
+			project_id: projectId,
+		});
+		const displayName = values.displayName.trim();
+		const { model: _legacyModel, mode: _legacyMode, effort: _legacyEffort, permissions: _legacyPermissions, ...sharedAgentConfig } = config.agentConfig ?? {};
+		const existingReviewer = config.reviewers?.[0];
+		const existingReviewerAgentConfig = existingReviewer?.harness === values.reviewerHarness ? existingReviewer.agentConfig : undefined;
+		const next: ProjectConfig = isScratchProject
+			? {
+					...scratchSupportedConfig(config),
+					worker: {
+						...config.worker,
+						agent: values.workerAgent,
+						agentConfig: buildRoleAgentConfig(config.worker?.agentConfig, values.workerModel, values.workerMode, values.workerEffort, values.workerPermissions),
+					},
+					orchestrator: {
+						...config.orchestrator,
+						agent: values.orchestratorAgent,
+						agentConfig: buildRoleAgentConfig(
+							config.orchestrator?.agentConfig,
+							values.orchestratorModel,
+							values.orchestratorMode,
+							values.orchestratorEffort,
+							values.orchestratorPermissions,
+						),
+					},
+					agentConfig: blankToUndefined({
+						...sharedAgentConfig,
+						permissions: undefined,
+					}),
 				}
+			: {
+					...config,
+					defaultBranch: values.defaultBranch.trim() === DEFAULT_BRANCH_AUTO ? undefined : values.defaultBranch || undefined,
+					sessionPrefix: values.sessionPrefix || undefined,
+					worker: {
+						...config.worker,
+						agent: values.workerAgent,
+						agentConfig: buildRoleAgentConfig(config.worker?.agentConfig, values.workerModel, values.workerMode, values.workerEffort, values.workerPermissions),
+					},
+					orchestrator: {
+						...config.orchestrator,
+						agent: values.orchestratorAgent,
+						agentConfig: buildRoleAgentConfig(
+							config.orchestrator?.agentConfig,
+							values.orchestratorModel,
+							values.orchestratorMode,
+							values.orchestratorEffort,
+							values.orchestratorPermissions,
+						),
+					},
+					agentConfig: blankToUndefined({
+						...sharedAgentConfig,
+						permissions: undefined,
+					}),
+					reviewers: values.reviewerHarness
+						? [
+								{
+									harness: values.reviewerHarness,
+									agentConfig: buildRoleAgentConfig(
+										existingReviewerAgentConfig,
+										values.reviewerModel,
+										values.reviewerMode,
+										values.reviewerEffort,
+										values.reviewerPermissions,
+									),
+								},
+							]
+						: undefined,
+					trackerIntake: buildIntake(
+						{
+							enabled: values.intakeEnabled,
+							repo: values.intakeRepo,
+							assignee: values.intakeAssignee,
+						},
+						config.trackerIntake,
+					),
+					autoReview: values.autoReview,
+					workersRequestReview: values.workersRequestReview || undefined,
+				};
+		const { error } = await (hostId ? clientForHost(hostId) : apiClient).PUT("/api/v1/projects/{id}", {
+			params: { path: { id: projectId } },
+			body: { displayName, config: next },
+		});
+		if (error) throw new Error(apiErrorMessage(error));
+		const replaceOrchestrator = replacementFailedRef.current || values.orchestratorAgent !== lastOrchestratorRef.current ||
+			(Boolean(activeOrchestrator && activeOrchestrator.provider !== values.orchestratorAgent) && !replacementAttemptedRef.current);
+		lastOrchestratorRef.current = values.orchestratorAgent;
+		if (replaceOrchestrator) {
+			replacementAttemptedRef.current = true;
+			try {
+				const sessionId = hostId
+					? await openRemoteOrchestrator(hostId, projectId, undefined, undefined, true, "settings")
+					: await spawnOrchestrator(projectId, "settings", true);
+				replacementFailedRef.current = false;
+				return {
+					replacementError: null,
+					replacementSessionId: sessionId,
+					replacementFailure: null,
+					spawnError: null,
+					savedKey,
+				} satisfies SettingsSaveResult;
+			} catch (error) {
+				replacementFailedRef.current = true;
+				const replacementFailure: OrchestratorReplacementFailure = {
+					message: error instanceof Error ? error.message : t("settings.project.replaceOrchestratorFailed"),
+					...(error instanceof OrchestratorSpawnError
+						? {
+								code: error.code,
+								requestId: error.requestId,
+								details: error.details,
+							}
+						: {}),
+				};
+				return {
+					replacementError: replacementFailure.message,
+					replacementSessionId: null,
+					replacementFailure,
+					spawnError: error,
+					savedKey,
+				} satisfies SettingsSaveResult;
 			}
-			return { replacementError: null };
-		},
-		onSuccess: (result) => {
+		}
+		return {
+			replacementError: null,
+			replacementSessionId: null,
+			replacementFailure: null,
+			spawnError: null,
+			savedKey,
+		} satisfies SettingsSaveResult;
+	};
+	const save = async (values: ProjectSettingsDraft) => {
+		try {
+			const result = await persist(values);
 			void captureRendererEvent("ao.renderer.settings_save_succeeded", { project_id: projectId });
-			setSavedAt(Date.now());
-			setReplacementError(result.replacementError);
-			setValidationError(null);
-			void queryClient.invalidateQueries({ queryKey: ["project", projectId] });
-			onSaved();
-		},
-		onError: () => {
+			void queryClient.invalidateQueries({ queryKey: projectQueryKey(projectId, hostId) });
+			void queryClient.invalidateQueries({ queryKey: hostId ? ["project-config", hostId, projectId] : ["project-config", projectId] });
+			void onSaved();
+			if (result.replacementFailure) {
+				if (!hostId) setOrchestratorReplacementError(projectId, result.replacementFailure);
+				if (result.spawnError) captureOrchestratorReplacementFailure(result.spawnError, hostId ? refKey({ host: hostId, id: projectId }) : projectId);
+			}
+			return { replacementError: result.replacementError };
+		} catch (error) {
 			void captureRendererEvent("ao.renderer.settings_save_failed", { project_id: projectId });
-		},
-	});
-
-	return (
-		<form
-			className="mx-auto flex max-w-2xl flex-col gap-4"
-			onSubmit={(event) => {
-				event.preventDefault();
-				setSavedAt(null);
-				setReplacementError(null);
-				if (missingRequiredAgent) {
-					setValidationError("Worker and orchestrator agents are required.");
-					return;
-				}
-				if (form.displayName.trim() === "") {
-					setValidationError("Project name is required.");
-					return;
-				}
-				if (intakeIncomplete) {
-					setValidationError("Enabling intake requires an assignee.");
-					return;
-				}
-				setValidationError(null);
-				mutation.mutate();
-			}}
-		>
-			<Card>
-				<CardHeader>
-					<CardTitle className="text-control">Identity</CardTitle>
-				</CardHeader>
-				<CardContent className="flex flex-col gap-4 font-mono text-xs text-muted-foreground">
-					<Field label="Project name" htmlFor="projectName">
-						<input
-							id="projectName"
-							className="h-control-form w-full rounded-md border border-input bg-transparent px-2.5 font-sans text-control text-foreground placeholder:text-passive focus-visible:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-weak"
-							value={form.displayName}
-							onChange={(e) => setForm((f) => ({ ...f, displayName: e.target.value }))}
-						/>
-					</Field>
-					<ReadonlyRow label="id" value={project.id} />
-					<ReadonlyRow label="kind" value={projectKindLabel(project.kind)} />
-					<ReadonlyRow label="path" value={project.path} />
-					<ReadonlyRow label="repo" value={project.repo || "—"} />
-				</CardContent>
-			</Card>
-
-			{project.kind === "workspace" && (
-				<Card>
-					<CardHeader>
-						<CardTitle className="text-[13px]">Workspace repos</CardTitle>
-					</CardHeader>
-					<CardContent className="flex flex-col gap-2">
-						{project.workspaceRepos?.length ? (
-							project.workspaceRepos.map((repo) => (
-								<div
-									key={repo.name}
-									className="grid grid-cols-[minmax(0,120px)_minmax(0,1fr)] gap-3 rounded-md border border-border px-3 py-2 font-mono text-[12px]"
-								>
-									<span className="truncate text-foreground">{repo.name}</span>
-									<span className="min-w-0 truncate text-muted-foreground">
-										{repo.relativePath}
-										{repo.repo ? ` · ${repo.repo}` : ""}
-									</span>
-								</div>
-							))
-						) : (
-							<p className="text-[12px] text-muted-foreground">No child repositories are registered.</p>
-						)}
-					</CardContent>
-				</Card>
-			)}
-
-			{!isScratchProject && (
-				<Card>
-					<CardHeader>
-						<CardTitle className="text-control">Worktrees</CardTitle>
-					</CardHeader>
-					<CardContent className="flex flex-col gap-4">
-						<Field label="Default branch" htmlFor="defaultBranch">
-							<input
-								id="defaultBranch"
-								className="h-control-form w-full rounded-md border border-input bg-transparent px-2.5 text-control text-foreground placeholder:text-passive focus-visible:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-weak"
-								value={form.defaultBranch}
-								onChange={(e) => setForm((f) => ({ ...f, defaultBranch: e.target.value }))}
-								placeholder="main"
-							/>
-						</Field>
-						<Field label="Session prefix" htmlFor="sessionPrefix">
-							<input
-								id="sessionPrefix"
-								className="h-control-form w-full rounded-md border border-input bg-transparent px-2.5 text-control text-foreground placeholder:text-passive focus-visible:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-weak"
-								value={form.sessionPrefix}
-								onChange={(e) => setForm((f) => ({ ...f, sessionPrefix: e.target.value }))}
-								placeholder="ao"
-							/>
-						</Field>
-					</CardContent>
-				</Card>
-			)}
-
-			<Card>
-				<CardHeader>
-					<CardTitle className="text-control">Agents</CardTitle>
-				</CardHeader>
-				<CardContent className="flex flex-col gap-4">
-					<RequiredAgentField
-						id="workerAgent"
-						value={form.workerAgent}
-						placeholder="Select worker agent"
-						label="Default worker agent"
-						authorized={agentCatalog?.authorized}
-						installed={agentCatalog?.installed}
-						supported={agentCatalog?.supported}
-						disabled={agentsQuery.isFetching && agentCatalog === undefined}
-						invalid={validationError !== null && form.workerAgent === ""}
-						onChange={(v) => setForm((f) => ({ ...f, workerAgent: v }))}
-					/>
-					<RequiredAgentField
-						id="orchestratorAgent"
-						value={form.orchestratorAgent}
-						placeholder="Select orchestrator agent"
-						label="Default orchestrator agent"
-						authorized={agentCatalog?.authorized}
-						installed={agentCatalog?.installed}
-						supported={agentCatalog?.supported}
-						disabled={agentsQuery.isFetching && agentCatalog === undefined}
-						invalid={validationError !== null && form.orchestratorAgent === ""}
-						onChange={(v) => setForm((f) => ({ ...f, orchestratorAgent: v }))}
-					/>
-					<div className="flex items-center justify-between gap-3 text-xs leading-row text-muted-foreground">
-						<span>Agent availability is cached.</span>
-						<button
-							type="button"
-							className="shrink-0 rounded text-foreground underline-offset-2 hover:underline disabled:pointer-events-none disabled:opacity-50"
-							disabled={refreshAgentsMutation.isPending}
-							onClick={() => refreshAgentsMutation.mutate()}
-						>
-							{refreshAgentsMutation.isPending ? "Refreshing..." : "Refresh agents"}
-						</button>
-					</div>
-					{refreshAgentsMutation.isError && (
-						<p className="text-xs leading-row text-error">
-							{refreshAgentsMutation.error instanceof Error
-								? refreshAgentsMutation.error.message
-								: "Could not refresh agent catalog."}
-						</p>
-					)}
-					{missingRequiredAgent && (
-						<p className="text-xs leading-row text-error">Worker and orchestrator agents are required.</p>
-					)}
-					<Field label="Model override" htmlFor="model">
-						<input
-							id="model"
-							className="h-control-form w-full rounded-md border border-input bg-transparent px-2.5 text-control text-foreground placeholder:text-passive focus-visible:border-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-weak"
-							value={form.model}
-							onChange={(e) => setForm((f) => ({ ...f, model: e.target.value }))}
-							placeholder="(agent default)"
-						/>
-					</Field>
-					<Field label="Permission mode" htmlFor="permissionMode">
-						<PermissionModeSelect
-							id="permissionMode"
-							value={form.permissions}
-							onChange={(v) => setForm((f) => ({ ...f, permissions: v }))}
-						/>
-					</Field>
-				</CardContent>
-			</Card>
-
-			{!isScratchProject && (
-				<Card>
-					<CardHeader>
-						<CardTitle className="text-control">Reviewers</CardTitle>
-					</CardHeader>
-					<CardContent className="flex flex-col gap-4">
-						<Field label="Default reviewer agent" htmlFor="reviewerHarness">
-							<ReviewerSelect
-								id="reviewerHarness"
-								value={form.reviewerHarness}
-								onChange={(v) => setForm((f) => ({ ...f, reviewerHarness: v }))}
-								authorized={agentCatalog?.authorized}
-								installed={agentCatalog?.installed}
-								supported={agentCatalog?.supported}
-								disabled={agentsQuery.isFetching && agentCatalog === undefined}
-							/>
-						</Field>
-					</CardContent>
-				</Card>
-			)}
-
-			{!isScratchProject && (
-				<Card>
-					<CardHeader>
-						<CardTitle className="text-control">Tracker intake</CardTitle>
-					</CardHeader>
-					<CardContent>
-						<IntakeFields form={intakeForm} onChange={patchIntake} repoPreview={{ value: effectiveIntakeRepo }} />
-					</CardContent>
-				</Card>
-			)}
-
-			<div className="flex items-center gap-3">
-				<Button type="submit" variant="primary" disabled={mutation.isPending}>
-					{mutation.isPending ? "Saving…" : "Save changes"}
-				</Button>
-				{validationError && <span className="text-xs text-error">{validationError}</span>}
-				{mutation.isError && (
-					<span className="text-xs text-error">
-						{mutation.error instanceof Error ? mutation.error.message : "Save failed"}
-					</span>
-				)}
-				{savedAt && !mutation.isPending && !mutation.isError && <span className="text-xs text-success">Saved.</span>}
-				{replacementError && !mutation.isPending && !mutation.isError && (
-					<span className="text-xs text-warning">Orchestrator restart failed: {replacementError}</span>
-				)}
-			</div>
-		</form>
-	);
+			throw error;
+		}
+	};
+	return <ProjectSettingsEditor initialValues={initialValues} section={section} disabled={!hostConnected}
+		capabilities={{ workflow: !isScratchProject, sessionPrefix: !isScratchProject, intake: intakeVisible, reviewer: !isScratchProject, requiredAgents: true, workersRequestReview: !isScratchProject }}
+		details={[{ label: t("settings.project.path"), value: project.path, href: hostId ? undefined : `file://${encodeURI(project.path)}` }, { label: t("settings.project.repo"), value: project.repo || "—", href: project.repo ? repositoryHref(project.repo) : undefined }]}
+		workspaceRepos={project.kind === "workspace" ? project.workspaceRepos ?? [] : undefined} repository={project.repo}
+		modelScope={() => projectId} defaultReviewer={(draft) => WORKER_DEFAULT_REVIEWERS[draft.workerAgent] ?? "claude-code"}
+		reviewerWarning={reviewerTrustWarning} save={save} saveUnchanged onSaveState={onSaveState}
+		modelHostId={hostId}
+		renderAgent={(props) => <LocalAgentPicker {...props} projectId={projectId} hostId={hostId} agentsQuery={agentsQuery} />} />;
 }
 
-function PermissionModeSelect({
-	id,
-	value,
-	onChange,
-}: {
-	id: string;
-	value: string;
-	onChange: (value: string) => void;
-}) {
-	return (
-		<Select value={value || "__default__"} onValueChange={(v) => onChange(v === "__default__" ? "" : v)}>
-			<SelectTrigger id={id} className="h-control-form w-full text-control">
-				<SelectValue />
-			</SelectTrigger>
-			<SelectContent>
-				<SelectItem value="__default__">Project default</SelectItem>
-				{PERMISSION_MODE_OPTIONS.map((opt) => (
-					<SelectItem key={opt.value} value={opt.value}>
-						{opt.label}
-					</SelectItem>
-				))}
-			</SelectContent>
-		</Select>
-	);
+function LocalAgentPicker({ role, draft, value, invalid, onChange, projectId, hostId, agentsQuery }: ProjectAgentPickerProps & { projectId: string; hostId?: string; agentsQuery: ReturnType<typeof useAgentReadinessQuery> }) {
+	const { t } = useTranslation();
+	useEnsureAgentReadiness({ agentIds: [draft.workerAgent, draft.orchestratorAgent, draft.reviewerHarness], enabled: role === "worker" && Boolean(draft.workerAgent || draft.orchestratorAgent || draft.reviewerHarness), hostId, purpose: hostId ? "launch" : "display" });
+	const disabled = agentsQuery.isFetching && agentsQuery.data === undefined;
+	const agents = hostId ? agentsQuery.data?.agents.filter(isLaunchableAgent) : agentsQuery.data?.agents;
+	return role === "reviewer"
+		? <ReviewerSelect value={value} model={draft.reviewerModel} mode={draft.reviewerMode} projectId={projectId} hostId={hostId} harnessOnly defaultHarness={WORKER_DEFAULT_REVIEWERS[draft.workerAgent] ?? "claude-code"} triggerClassName="w-full" onChange={onChange} ariaLabel={t("settings.project.defaultReviewer")} agents={agents} disabled={disabled} />
+		: <RequiredAgentField id={`${role}Agent`} variant="settings-control" value={value} placeholder={t(role === "worker" ? "settings.project.selectWorker" : "settings.project.selectOrchestrator")} label={t(role === "worker" ? "settings.project.defaultWorker" : "settings.project.defaultOrchestrator")} agents={agents} hostId={hostId} disabled={disabled} invalid={invalid} onChange={onChange} />;
 }
 
-const REVIEWER_AGENT_PRIORITY = ["claude-code", "codex", "cursor", "opencode", "aider"] as const;
-const REVIEWER_AGENT_PRIORITY_RANK = new Map<string, number>(
-	REVIEWER_AGENT_PRIORITY.map((agent, index) => [agent, index]),
-);
-
-function agentLabelCompare(a: components["schemas"]["AgentInfo"], b: components["schemas"]["AgentInfo"]): number {
-	return a.label.localeCompare(b.label) || a.id.localeCompare(b.id);
-}
-
-function ReviewerSelect({
-	id,
-	value,
-	onChange,
-	disabled = false,
-	authorized,
-	installed,
-	supported,
-}: {
-	id: string;
-	value: string;
-	onChange: (value: string) => void;
-	disabled?: boolean;
-	authorized?: components["schemas"]["AgentInfo"][];
-	installed?: components["schemas"]["AgentInfo"][];
-	supported?: components["schemas"]["AgentInfo"][];
-}) {
-	const fallbackAgents: components["schemas"]["AgentInfo"][] = [...KNOWN_REVIEWER_HARNESS_IDS].map((id) => ({
-		id,
-		label: id,
-	}));
-	const filteredSupported = (supported ?? fallbackAgents).filter((a) => KNOWN_REVIEWER_HARNESS_IDS.has(a.id));
-	const supportedAgents = filteredSupported.length > 0 ? filteredSupported : fallbackAgents;
-	const installedAgents = installed ?? supportedAgents;
-	const authorizedAgents = authorized ?? supportedAgents;
-	const authorizedIds = new Set(authorizedAgents.map((agent) => agent.id));
-	const installedById = new Map(installedAgents.map((agent) => [agent.id, agent]));
-	const options = supportedAgents
-		.map((agent) => {
-			const installedAgent = installedById.get(agent.id);
-			const authStatus = installedAgent?.authStatus;
-			const isAuthorized = authorizedIds.has(agent.id) || authStatus === "authorized";
-			const isAuthUnknown = Boolean(installedAgent) && !isAuthorized && authStatus !== "unauthorized";
-			const isSelectable = isAuthorized || isAuthUnknown;
-			const rank = isAuthorized ? 0 : isAuthUnknown ? 1 : installedAgent ? 2 : 3;
-			return {
-				...agent,
-				disabled: !isSelectable,
-				priorityRank: REVIEWER_AGENT_PRIORITY_RANK.get(agent.id) ?? Number.MAX_SAFE_INTEGER,
-				rank,
-				reason: !installedAgent ? "Needs install" : isAuthUnknown ? "Auth unknown" : !isAuthorized ? "Needs auth" : "",
-				warning: isAuthUnknown,
-			};
-		})
-		.sort((a, b) => a.rank - b.rank || a.priorityRank - b.priorityRank || agentLabelCompare(a, b));
-
-	return (
-		<Select
-			value={value || "__default__"}
-			onValueChange={(v) => onChange(v === "__default__" ? "" : v)}
-			disabled={disabled}
-		>
-			<SelectTrigger id={id} size="sm" className="w-full text-control">
-				<SelectValue />
-			</SelectTrigger>
-			<SelectContent position="popper" side="bottom" align="start" sideOffset={4} className="max-h-select-menu-max!">
-				<SelectItem value="__default__">Project default</SelectItem>
-				{options.map((agent) => (
-					<SelectItem key={agent.id} value={agent.id} disabled={agent.disabled} className="[&>span:last-child]:w-full">
-						<span className="flex min-w-0 w-full items-center justify-between gap-4">
-							<span className="truncate">{agent.label}</span>
-							{agent.reason && (
-								<span className="inline-flex shrink-0 items-center gap-1 text-caption text-muted-foreground">
-									{agent.warning && <TriangleAlert className="size-3 text-warning" aria-hidden="true" />}
-									{agent.reason}
-								</span>
-							)}
-						</span>
-					</SelectItem>
-				))}
-			</SelectContent>
-		</Select>
-	);
-}
-
-function Field({ label, htmlFor, children }: { label: string; htmlFor?: string; children: React.ReactNode }) {
-	return (
-		<div className="flex flex-col gap-1.5">
-			<Label htmlFor={htmlFor} className="text-xs text-muted-foreground">
-				{label}
-			</Label>
-			{children}
-		</div>
-	);
-}
-
-function ReadonlyRow({ label, value }: { label: string; value: string }) {
-	return (
-		<div className="flex items-center gap-3">
-			<span className="w-12 shrink-0 text-passive">{label}</span>
-			<span className="min-w-0 flex-1 truncate text-foreground">{value}</span>
-		</div>
-	);
-}
-
-function CenteredNote({ children }: { children: React.ReactNode }) {
-	return (
-		<div className="grid h-full place-items-center bg-background p-6 text-center text-xs text-passive">{children}</div>
-	);
-}
-
-function projectKindLabel(kind: string): string {
-	switch (kind) {
-		case "single_repo":
-			return "single repo";
-		case "workspace":
-			return "workspace";
-		case "scratch":
-			return "scratch";
-		default:
-			return kind || "unknown";
+function repositoryHref(repository: string): string | undefined {
+	if (/^https?:\/\//i.test(repository)) return repository;
+	if (repository.startsWith("git@")) {
+		const [host, path] = repository.slice(4).split(":", 2);
+		return `https://${host}/${path.replace(/\.git$/, "")}`;
 	}
+	if (repository.startsWith("ssh://")) {
+		try {
+			const parsed = new URL(repository);
+			return `https://${parsed.hostname}${parsed.pathname.replace(/\.git$/, "")}`;
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
 }
 
 function scratchSupportedConfig(config: ProjectConfig): ProjectConfig {
-	const { defaultBranch: _defaultBranch, reviewers: _reviewers, trackerIntake: _trackerIntake, ...supported } = config;
+	const {
+		defaultBranch: _defaultBranch,
+		reviewers: _reviewers,
+		autoReview: _legacyAutoReview,
+		workersRequestReview: _workersRequestReview,
+		trackerIntake: _trackerIntake,
+		...supported
+	} = config as ProjectConfig;
 	return supported;
 }
 
-// Drop an object whose every value is undefined so we send `undefined` (omit)
-// rather than an empty {} the daemon would persist.
 function blankToUndefined<T extends object>(obj: T): T | undefined {
 	return Object.values(obj).some((v) => v !== undefined) ? obj : undefined;
+}
+
+function buildRoleAgentConfig(
+	existing: components["schemas"]["AgentConfig"] | undefined,
+	model: string,
+	mode: string,
+	effort: string,
+	permissions: string,
+): components["schemas"]["AgentConfig"] | undefined {
+	const next = { ...existing };
+	if (model) next.model = model;
+	else delete next.model;
+	if (mode) next.mode = mode;
+	else delete next.mode;
+	if (effort) next.effort = effort;
+	else delete next.effort;
+	if (permissions) next.permissions = permissions as components["schemas"]["AgentConfig"]["permissions"];
+	else delete next.permissions;
+	return Object.keys(next).length > 0 ? next : undefined;
 }

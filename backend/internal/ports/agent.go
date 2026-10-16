@@ -3,9 +3,20 @@ package ports
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+)
+
+var (
+	// ErrUnsupportedEffort reports a value the selected model did not advertise.
+	ErrUnsupportedEffort = errors.New("unsupported model effort")
+	// ErrModelCapabilitiesUnavailable reports tuning that cannot be validated safely.
+	ErrModelCapabilitiesUnavailable = errors.New("model capabilities unavailable")
+	// ErrAgentAuthRequired means a launch-fresh provider check rejected the
+	// credential selected by the session's cwd and environment.
+	ErrAgentAuthRequired = errors.New("agent requires authentication")
 )
 
 // ErrAgentBinaryNotFound is returned by agent adapters when neither PATH nor
@@ -14,6 +25,29 @@ import (
 // silently launch into an empty tmux pane that the reaper later mistakes
 // for a live session.
 var ErrAgentBinaryNotFound = errors.New("agent: binary not found on PATH")
+
+// ErrAgentBinaryIdentityUnknown is returned by a startup-only presence check
+// when a name-matching executable exists but the adapter's identity probe has
+// not confirmed it. It is deliberately distinct from ErrAgentBinaryNotFound:
+// callers must not present an unverified name-only match as installed.
+var ErrAgentBinaryIdentityUnknown = errors.New("agent: binary identity unknown")
+
+// ErrAgentModelDiscoverySignInRequired is returned by model discovery when the
+// agent's model-list command would start an interactive sign-in because the
+// CLI is not confirmed as signed in. It is not a discovery failure: callers
+// keep the last catalog and retry once the agent reports a login.
+var ErrAgentModelDiscoverySignInRequired = errors.New("agent: sign-in required to list models")
+
+// ErrAgentModelDiscoveryCredentialRejected marks a discovery failure caused by
+// the provider definitively rejecting the agent's credential. The catalog
+// service reports it as an auth problem so clients can offer a login instead
+// of a raw provider error.
+var ErrAgentModelDiscoveryCredentialRejected = errors.New("agent: credential rejected while listing models")
+
+// ErrAgentModelDiscoveryCredentialExpired marks a discovery failure caused by
+// a stored login whose access token expired while a refresh token remains.
+// The agent CLI renews such a login on its next run; it is not a sign-out.
+var ErrAgentModelDiscoveryCredentialExpired = errors.New("agent: stored login expired while listing models")
 
 // AgentAuthStatus describes the result of a short local auth probe for an
 // installed agent. It is advisory only: credentials, quota, selected model
@@ -29,7 +63,101 @@ const (
 	AgentAuthStatusUnauthorized AgentAuthStatus = "unauthorized"
 	// AgentAuthStatusUnknown means the daemon could not determine auth status.
 	AgentAuthStatusUnknown AgentAuthStatus = "unknown"
+	// AgentAuthStatusConfigured means a credential is present locally but no
+	// check has proven it valid. Presence is not validity: a key can be
+	// revoked, downgraded, or rate-limited with no change on disk, so only a
+	// provider round-trip may report AgentAuthStatusAuthorized. Local evidence
+	// (a config file, an env var, or a CLI that reports loggedIn) reports
+	// configured instead, and must never render as a ready state.
+	AgentAuthStatusConfigured AgentAuthStatus = "configured"
 )
+
+// HasCredential reports whether a check found a credential, verified or only
+// configured.
+func (s AgentAuthStatus) HasCredential() bool {
+	return s == AgentAuthStatusAuthorized || s == AgentAuthStatusConfigured
+}
+
+// AuthEvidence collects what an authentication check relied on, so readiness
+// can say why a harness reads as signed in. Adapters record through
+// RecordAuthEvidence; without a collector in the context it does nothing.
+type AuthEvidence struct {
+	mu          sync.Mutex
+	identity    domain.AgentAccountIdentity
+	diagnostics []domain.AgentAuthDiagnostic
+}
+
+type authEvidenceKey struct{}
+
+// WithAuthEvidence returns a context that collects authentication evidence.
+func WithAuthEvidence(ctx context.Context) (context.Context, *AuthEvidence) {
+	evidence := &AuthEvidence{}
+	return context.WithValue(ctx, authEvidenceKey{}, evidence), evidence
+}
+
+// RecordAuthEvidence records what made a check succeed. A later record
+// replaces an earlier one, so adapters record at the point they decide.
+func RecordAuthEvidence(ctx context.Context, identity domain.AgentAccountIdentity) {
+	evidence, ok := ctx.Value(authEvidenceKey{}).(*AuthEvidence)
+	if !ok || evidence == nil {
+		return
+	}
+	evidence.mu.Lock()
+	evidence.identity = identity
+	evidence.mu.Unlock()
+}
+
+// AddAuthEvidence fills fields the recorded evidence leaves empty, such as
+// an email learned after the deciding file or variable was recorded.
+func AddAuthEvidence(ctx context.Context, identity domain.AgentAccountIdentity) {
+	evidence, ok := ctx.Value(authEvidenceKey{}).(*AuthEvidence)
+	if !ok || evidence == nil {
+		return
+	}
+	evidence.mu.Lock()
+	evidence.identity = evidence.identity.Merge(identity)
+	evidence.mu.Unlock()
+}
+
+// Identity returns the recorded evidence.
+func (e *AuthEvidence) Identity() domain.AgentAccountIdentity {
+	if e == nil {
+		return domain.AgentAccountIdentity{}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.identity
+}
+
+// RecordAuthDiagnostic retains an adapter-authored check outcome, including
+// unsuccessful attempts. Never pass raw errors, credential values or CLI output.
+func RecordAuthDiagnostic(ctx context.Context, diagnostic domain.AgentAuthDiagnostic) {
+	evidence, ok := ctx.Value(authEvidenceKey{}).(*AuthEvidence)
+	if !ok || evidence == nil {
+		return
+	}
+	evidence.mu.Lock()
+	defer evidence.mu.Unlock()
+	if len(evidence.diagnostics) < 64 {
+		evidence.diagnostics = append(evidence.diagnostics, diagnostic)
+	}
+}
+
+// Diagnostics returns an independent snapshot of the recorded check outcomes.
+func (e *AuthEvidence) Diagnostics() []domain.AgentAuthDiagnostic {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]domain.AgentAuthDiagnostic(nil), e.diagnostics...)
+}
+
+// AgentAuthDiagnosticsChecker adds the signed-in account and evidence from the
+// same check as the verdict, so neither needs a second probe.
+type AgentAuthDiagnosticsChecker interface {
+	AuthStatusWithDiagnostics(context.Context) (AgentAuthStatus, domain.AgentAccountIdentity, []domain.AgentAuthDiagnostic, error)
+}
 
 // Agent is the contract every CLI coding agent adapter (claude-code, codex, …)
 // must satisfy. It supplies the argv and process configuration the Session
@@ -65,10 +193,278 @@ type AgentAuthChecker interface {
 	AuthStatus(ctx context.Context) (AgentAuthStatus, error)
 }
 
+// AgentLaunchAuthValidator is the optional launch gate for adapters whose
+// credential source depends on the project cwd or environment. Implementations
+// must perform a fresh provider check instead of trusting display/readiness
+// caches; unknown or uncheckable credentials remain advisory.
+type AgentLaunchAuthValidator interface {
+	ValidateLaunchAuth(ctx context.Context, workingDir string, env map[string]string) (AgentAuthStatus, error)
+}
+
 // AgentBinaryResolver is the optional capability adapters expose when their
 // binary can be checked without constructing a real session launch command.
 type AgentBinaryResolver interface {
 	ResolveBinary(ctx context.Context) (path string, err error)
+}
+
+// AgentRuntimeLaunchEnv augments a terminal launch after its generation has
+// been assigned. Native reporters can then carry that generation in their
+// own protocol identity. Implementations only modify the supplied environment.
+type AgentRuntimeLaunchEnv interface {
+	AugmentRuntimeLaunchEnv(env map[string]string, dataDir string, sessionID domain.SessionID, launchID string)
+}
+
+// AgentNativeSessionResolver is an optional capability for adapters whose
+// lifecycle protocol reports a process-local correlation id rather than the
+// durable conversation id accepted by their resume command.
+type AgentNativeSessionResolver interface {
+	ResolveNativeSessionID(ctx context.Context, cfg NativeSessionResolveConfig) (sessionID string, ok bool, err error)
+}
+
+// NativeSessionResolveConfig identifies one supervised agent launch. DataDir
+// and the two AO ids locate adapter-owned launch metadata without trusting a
+// provider-supplied path.
+type NativeSessionResolveConfig struct {
+	DataDir   string
+	SessionID domain.SessionID
+	LaunchID  string
+}
+
+// AgentBinaryResolutionInvalidator is an optional capability for adapters that
+// cache the executable path. Install and reinstall flows use it to make the
+// next readiness, model-discovery, or launch operation resolve the current
+// local installation again.
+type AgentBinaryResolutionInvalidator interface {
+	InvalidateBinaryResolution()
+}
+
+// AgentBinaryPresenceResolver is an optional startup-only refinement for an
+// adapter whose normal binary resolution performs additional validation. It
+// must only inspect local executable paths; it must not start the agent CLI.
+// AO uses it for the first-render prerequisite gate. Identity-sensitive
+// adapters may return ErrAgentBinaryIdentityUnknown when existence alone is
+// insufficient; that result remains unknown until a normal identity probe.
+type AgentBinaryPresenceResolver interface {
+	ResolveBinaryPresence(ctx context.Context) (path string, err error)
+}
+
+// AgentReadinessProvider is the daemon-owned coordination boundary used by
+// launch and policy consumers. Implementations coalesce native checks and keep
+// the resulting snapshots in memory.
+type AgentReadinessProvider interface {
+	EnsureAgentReadiness(ctx context.Context, agentID string, purpose domain.AgentReadinessPurpose) (domain.AgentReadinessSnapshot, error)
+	InvalidateAgentInstallation(agentID string)
+	InvalidateAgentAuthentication(agentID string)
+	RecheckAgent(agentID string)
+}
+
+// AgentNativeSessionTerminator is an optional adapter capability used before
+// AO destroys a terminal runtime or worktree whose agent may keep running in a
+// detached native process. Implementations must affect only the supplied
+// session and leave its transcript resumable.
+type AgentNativeSessionTerminator interface {
+	TerminateNativeSession(ctx context.Context, session SessionRef) error
+}
+
+// AgentInterfaceHandoff is an OPTIONAL capability for a TUI adapter whose
+// native resume identity is also understood by its structured Chat driver.
+// Merely supporting GetRestoreCommand is not enough: some harnesses expose a
+// different identifier through their TUI and protocol surfaces.
+type AgentInterfaceHandoff interface {
+	NativeConversationID(
+		ctx context.Context,
+		session SessionRef,
+		currentMode domain.SessionMode,
+		providerConversationID string,
+	) (id string, ok bool, err error)
+}
+
+// AgentInterfaceHandoffHistoryProbe is an OPTIONAL refinement for adapters
+// that reserve a native conversation id before the provider has persisted any
+// history. A missing history record means an interface transition may safely
+// start the target fresh: there is no provider context to carry. Without this
+// capability, Session Manager conservatively treats every declared id as an
+// existing conversation and requires a native resume.
+type AgentInterfaceHandoffHistoryProbe interface {
+	NativeConversationExists(
+		ctx context.Context,
+		session SessionRef,
+		nativeConversationID string,
+		env map[string]string,
+	) (bool, error)
+}
+
+// AgentInterfaceHandoffStorageBridge is an OPTIONAL capability for adapters
+// whose native conversation files live in interface-specific storage roots.
+// Session Manager calls it only after the source controller is stopped.
+type AgentInterfaceHandoffStorageBridge interface {
+	PrepareInterfaceHandoffStorage(
+		ctx context.Context,
+		session SessionRef,
+		from, to domain.SessionMode,
+		nativeConversationID string,
+		env map[string]string,
+	) error
+}
+
+// ModelSelectionMode tells clients how to render an agent's model control.
+type ModelSelectionMode string
+
+const (
+	// ModelSelectionCatalog renders a model list reported by the selected agent.
+	ModelSelectionCatalog ModelSelectionMode = "catalog"
+	// ModelSelectionText renders a free-form model id input.
+	ModelSelectionText ModelSelectionMode = "text"
+	// ModelSelectionModeList renders an agent-owned mode list rather than model ids.
+	ModelSelectionModeList ModelSelectionMode = "mode"
+)
+
+// CustomModelEntryMode tells clients how an agent handles models that are not
+// present in its current catalog.
+type CustomModelEntryMode string
+
+const (
+	// CustomModelEntryNone means the agent only accepts its reported choices.
+	CustomModelEntryNone CustomModelEntryMode = "none"
+	// CustomModelEntryDirect means AO may pass a user-entered model id directly.
+	CustomModelEntryDirect CustomModelEntryMode = "direct"
+	// CustomModelEntryConfigured means custom models must first be configured in
+	// the agent and then discovered by AO as ordinary catalog entries.
+	CustomModelEntryConfigured CustomModelEntryMode = "configured"
+)
+
+// AgentModelInfo is one model or mode that an adapter reports as selectable.
+type AgentModelInfo struct {
+	// ContextWindow and Inputs are populated only from provider catalog metadata.
+	// Zero/nil means unknown, not an inferred capability.
+	ContextWindow int64    `json:"contextWindow,omitempty"`
+	Inputs        []string `json:"inputs,omitempty"`
+	ID            string   `json:"id"`
+	Label         string   `json:"label"`
+	Provider      string   `json:"provider,omitempty"`
+	IsDefault     bool     `json:"isDefault,omitempty"`
+	// Efforts are the reasoning levels this specific model accepts, in the
+	// provider's own ascending order. Empty means the model takes no effort
+	// setting, which is a real answer rather than a missing one — Sonnet 4.5
+	// and Haiku 4.5 accept none while the 5 family accepts five — so a picker
+	// must render no effort control at all rather than an empty one.
+	Efforts       []string `json:"efforts,omitempty"`
+	DefaultEffort string   `json:"defaultEffort,omitempty"`
+	// LastUsedAt is the latest activity of a session in scope whose current model
+	// is this model. It is derived from session history on every read, never
+	// stored on the cached catalog, and absent for a model no session ran.
+	LastUsedAt *time.Time `json:"lastUsedAt,omitempty"`
+}
+
+// AgentModelCatalog is AO's normalized model-picker response.
+type AgentModelCatalog struct {
+	// Providers includes reported provider IDs even when they currently have no models.
+	Providers []string `json:"providers,omitempty"`
+	// ConfiguredProviders names providers with credential configuration observed
+	// during discovery. Presence is not proof of authorization; absence is unknown.
+	// Only provider IDs are exposed, never credential values or source paths.
+	ConfiguredProviders []string             `json:"configuredProviders,omitempty"`
+	AgentID             string               `json:"agentId"`
+	SelectionMode       ModelSelectionMode   `json:"selectionMode" enum:"catalog,text,mode"`
+	Models              []AgentModelInfo     `json:"models"`
+	CustomModelEntry    CustomModelEntryMode `json:"customModelEntry" enum:"none,direct,configured"`
+	// AllowCustom is retained for compatibility and is true only for direct entry.
+	AllowCustom bool   `json:"allowCustom"`
+	Source      string `json:"source"`
+	// Metadata describes the non-sensitive installed adapter inputs used for
+	// discovery (for example the resolved binary and adapter source kind).
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// InputFingerprint changes whenever an upgrade, auth/config input, or
+	// project scope could produce a different catalog.
+	InputFingerprint string `json:"inputFingerprint,omitempty"`
+	// BinaryVersion is the legacy wire name for AO's non-sensitive executable
+	// and configuration metadata fingerprint.
+	BinaryVersion string     `json:"binaryVersion,omitempty"`
+	FetchedAt     time.Time  `json:"fetchedAt"`
+	ValidatedAt   time.Time  `json:"validatedAt,omitempty"`
+	LastSuccessAt *time.Time `json:"lastSuccessAt,omitempty"`
+	RefreshState  string     `json:"refreshState,omitempty" enum:"idle,queued,refreshing,error"`
+	RefreshError  string     `json:"refreshError,omitempty"`
+	RetryAt       *time.Time `json:"retryAt,omitempty"`
+	// RefreshRecommended tells cache-first clients to revalidate in the
+	// background while continuing to display the cached catalog.
+	RefreshRecommended bool   `json:"refreshRecommended,omitempty"`
+	Stale              bool   `json:"stale"`
+	Warning            string `json:"warning,omitempty"`
+	// WarningCode classifies Warning when it is an authentication problem, so
+	// clients can offer the agent's login instead of showing provider text.
+	// auth_required: the agent is signed out or its credential was rejected.
+	// auth_expired: a stored login's access token expired; the agent CLI
+	// renews it on its next run.
+	WarningCode string `json:"warningCode,omitempty" enum:"auth_required,auth_expired"`
+}
+
+// Model catalog warning codes.
+const (
+	ModelCatalogWarningAuthRequired = "auth_required"
+	ModelCatalogWarningAuthExpired  = "auth_expired"
+)
+
+// CachedAgentModelCatalog is the persistence record used by the model-catalog
+// service. CatalogJSON contains a serialized AgentModelCatalog.
+type CachedAgentModelCatalog struct {
+	AgentID          string
+	ProjectID        string
+	BinaryVersion    string // Legacy field name for the discovery-input metadata fingerprint.
+	CatalogJSON      string
+	Source           string
+	FetchedAt        time.Time
+	MetadataJSON     string
+	InputFingerprint string
+	LastSuccessAt    time.Time
+	RefreshState     string
+	RefreshError     string
+	RetryCount       int64
+	RetryAt          time.Time
+	Generation       int64
+}
+
+// AgentModelCatalogCache persists normalized model catalogs across daemon
+// restarts. Global catalogs use the empty project scope; BinaryVersion tracks
+// the installed agent/config fingerprint used for invalidation.
+type AgentModelCatalogCache interface {
+	GetAgentModelCatalog(ctx context.Context, agentID, projectID string) (CachedAgentModelCatalog, bool, error)
+	ListAgentModelCatalogsByAgent(ctx context.Context, agentID string) ([]CachedAgentModelCatalog, error)
+	UpsertAgentModelCatalog(ctx context.Context, record CachedAgentModelCatalog) error
+}
+
+// AgentModelCatalogScopeCache supports daemon-wide startup prefetch while
+// keeping the smaller cache contract easy to fake at focused boundaries.
+type AgentModelCatalogScopeCache interface {
+	ListAgentModelCatalogs(ctx context.Context) ([]CachedAgentModelCatalog, error)
+}
+
+// AgentModelDiscoveryRequest describes one bounded, adapter-defined model
+// discovery attempt. Args remain owned by the concrete discovery adapter.
+type AgentModelDiscoveryRequest struct {
+	AgentID    string
+	Binary     string
+	WorkingDir string
+	Env        map[string]string
+	// CredentialType names a cloud credential kind (e.g. "anthropic_api_key")
+	// when discovery must reflect the models a *cloud* session's pushed
+	// credential can run rather than the local machine's own auth. Adapters that
+	// gate their catalog on provider presence (opencode) honor it; others ignore
+	// it. Empty for ordinary local, project-scoped discovery.
+	CredentialType string
+}
+
+// AgentModelDiscoverer isolates CLI execution and discovery-input
+// fingerprinting from the core agent service.
+type AgentModelDiscoverer interface {
+	Discover(ctx context.Context, request AgentModelDiscoveryRequest) (AgentModelCatalog, error)
+	// CatalogFingerprint summarizes every input a discovery run would read: the
+	// resolved executable plus any configuration the adapter consults. The
+	// service compares it against the cached catalog's fingerprint, so it must
+	// change whenever the catalog those inputs produce would change, and it must
+	// stay cheap enough to compute before deciding to skip discovery.
+	CatalogFingerprint(ctx context.Context, request AgentModelDiscoveryRequest) string
+	Manual(agentID string) AgentModelCatalog
 }
 
 // AgentExitDetectionMode describes how AO learns that an agent CLI process
@@ -89,13 +485,65 @@ type AgentExitDetector interface {
 
 // AgentPromptReadinessProvider is an optional capability for interactive
 // adapters that receive their first task after startup. It lets AO wait until a
-// terminal UI is ready before injecting text through the runtime.
+// terminal UI is ready before injecting text through the runtime. When the
+// adapter also implements TerminalActivityDetector, an authoritative idle
+// detection takes precedence over the fallback text patterns.
 type AgentPromptReadinessProvider interface {
 	PromptReadinessHints(ctx context.Context, cfg LaunchConfig) (PromptReadinessHints, error)
 }
 
+// AgentAfterStartPromptBuilder is an optional capability for interactive
+// adapters that need to combine launch-only context with the first user turn.
+// AO calls it exactly once per after-start delivery and sends the returned
+// value only after the runtime is ready.
+type AgentAfterStartPromptBuilder interface {
+	BuildAfterStartPrompt(ctx context.Context, cfg LaunchConfig) (string, error)
+}
+
+// TerminalActivityDetector derives activity only from authoritative terminal UI markers.
+type TerminalActivityDetector interface {
+	DetectTerminalActivity(output string) (domain.ActivityState, bool)
+}
+
+// EmptyComposerDetector is an opt-in safety capability for unsolicited
+// coordination sent to an already-running interactive agent. It must return
+// true only when current terminal evidence positively proves that the active
+// composer contains no human-authored draft. A stale activity=idle fact alone
+// is insufficient because typing into a composer does not emit a lifecycle
+// hook until the human submits it.
+type EmptyComposerDetector interface {
+	ComposerIsEmpty(output string) bool
+}
+
+// WaitingInputComposerReadiness is an opt-in capability for adapters where an
+// empty composer authoritatively proves that a durable waiting_input state is
+// safe for unsolicited delivery. EmptyComposerDetector alone is insufficient:
+// other harnesses can render an empty composer beside a permission or
+// structured-input boundary.
+type WaitingInputComposerReadiness interface {
+	EmptyComposerProvesWaitingInputReady() bool
+}
+
+// ContinuousTerminalActivityDetector is implemented by adapters whose TUI is
+// the only authoritative source for some activity transitions. These adapters
+// are sampled on every observer tick, including while idle or waiting for
+// input, so terminal state can move in either direction.
+type ContinuousTerminalActivityDetector interface {
+	TerminalActivityDetector
+	ContinuouslyDetectTerminalActivity() bool
+}
+
+// WaitingTerminalActivityDetector is implemented by non-continuous terminal
+// detectors that can authoritatively recover from a durable waiting-input state.
+type WaitingTerminalActivityDetector interface {
+	TerminalActivityDetector
+	ContinuouslyDetectTerminalActivityWhileWaiting() bool
+}
+
 // PromptReadinessHints describes when an after-start prompt should be sent.
-// Empty hints mean "send immediately" to preserve existing adapter behavior.
+// Empty patterns mean "send immediately" unless the adapter also implements
+// TerminalActivityDetector, in which case AO waits for an authoritative idle
+// detection. A non-positive timeout always preserves immediate delivery.
 type PromptReadinessHints struct {
 	InitialDelay time.Duration
 	Patterns     []string
@@ -112,38 +560,62 @@ type AgentResolver interface {
 	Agent(harness domain.AgentHarness) (Agent, bool)
 }
 
-// ActivitySignaler is an OPTIONAL capability an Agent adapter may implement to
-// describe which durable activity signals its harness actually produces under
-// AO's headless launch. The Session Manager gates best-effort post-send
-// confirmation on it — see the two methods.
+// SubmitActivitySignaler is an OPTIONAL capability an Agent adapter may
+// implement to report whether its harness emits a prompt-submit signal (one
+// that flips Activity.State to active). Without it the confirm loop could
+// never observe active and would only burn its budget on spurious Enter
+// nudges.
 //
-// EmitsSubmitActivity reports whether the harness emits a prompt-submit signal
-// (one that flips Activity.State to active). Without it the confirm loop could
-// never observe active and would only burn its budget on spurious Enter nudges.
-//
-// EmitsBlockedActivity reports whether the harness emits a decision-pause
-// signal (a permission/approval prompt that flips Activity.State to blocked)
-// AND can clear that state before the turn ends — which requires the
-// pre/post-tool-use trio so lifecycle can correlate the approved tool's post
-// with the dialog that blocked the session. The Enter-only nudge is only SAFE
-// when this is true: a harness that submits but cannot report blocked leaves
-// the confirm loop unable to tell an unsubmitted draft from a pending
-// permission dialog, so an Enter meant to resubmit the draft could instead
-// answer the dialog. confirmActive therefore requires BOTH signals before it
-// will nudge.
-//
-// Only claude-code satisfies both halves: it installs the pre/post-tool-use
-// trio that lets lifecycle correlate the approved tool's post with the dialog
-// and clear blocked before the turn ends. codex maps permission-request to
-// waiting_input and opts out (no tool trio → blocked could not be cleared).
-// Every other harness simply does not implement this interface; it maps its
-// permission signal to waiting_input via the shared deriver and gets the
-// paste settle delay but no confirm loop. Adapters that later gain a
-// correlatable blocked signal implement this interface to opt in; see the
-// fork/archive/blocked-mappings branch for the prior 13-harness mapping set.
-type ActivitySignaler interface {
+// The Session Manager uses this as one half of the bounded Enter
+// re-submission gate for both ordinary messages and switched-agent
+// continuations; it also requires BlockedActivitySignaler before it will
+// nudge — see harnessNudgeSafe.
+type SubmitActivitySignaler interface {
 	EmitsSubmitActivity() bool
+}
+
+// SemanticMessageAcceptanceSignaler is implemented only by TUI adapters whose
+// native prompt hook returns the accepted prompt text to AO. It lets internal
+// durable senders correlate a specific message with provider acceptance.
+type SemanticMessageAcceptanceSignaler interface {
+	EmitsSemanticMessageAcceptance() bool
+}
+
+// BlockedActivitySignaler is an OPTIONAL capability an Agent adapter may
+// implement to report whether its harness emits a decision-pause signal (a
+// permission/approval prompt that flips Activity.State to blocked) AND can
+// clear that state before the turn ends — which requires the pre/post-tool-
+// use trio so lifecycle can correlate the approved tool's post with the dialog
+// that blocked the session. The Enter-only nudge is only SAFE when this is
+// true: a harness that submits but cannot report blocked leaves the confirm
+// loop unable to tell an unsubmitted draft from a pending permission dialog,
+// so an Enter meant to resubmit the draft could instead answer the dialog.
+//
+// Two adapters satisfy this today:
+//
+//   - claude-code installs the pre/post-tool-use trio that lets lifecycle
+//     correlate the approved tool's post with the dialog and clear blocked
+//     before the turn ends.
+//   - kimchi installs the same trio and maps Notification(permission_prompt)
+//     to ActivityBlocked. Unlike claude-code, kimchi has no separate
+//     permission-request hook — the blocked signal arrives via a Notification
+//     event whose payload carries tool_use_id, which the lifecycle correlator
+//     matches against the inflight map populated by PreToolUse.
+//
+// codex maps permission-request to waiting_input and opts out (no tool trio →
+// blocked could not be cleared). Adapters that later gain a correlatable
+// blocked signal implement this interface to opt in.
+type BlockedActivitySignaler interface {
 	EmitsBlockedActivity() bool
+}
+
+// StartupInputReadinessSignaler is an OPTIONAL capability for a TUI adapter
+// whose first lifecycle hook cannot arrive until native startup dialogs have
+// cleared and the agent can safely accept pane input. AO gates user and
+// automation writes on FirstSignalAt only for adapters that opt in here;
+// hookless adapters must remain usable without manufacturing a signal.
+type StartupInputReadinessSignaler interface {
+	FirstSignalProvesInputReady() bool
 }
 
 // ActiveTurnSteerer is an OPTIONAL capability an Agent adapter implements when
@@ -162,6 +634,10 @@ type ActiveTurnSteerer interface {
 // Session Manager can bridge its typed metadata onto a SessionRef without
 // either side hard-coding the other's vocabulary.
 const MetadataKeyAgentSessionID = "agentSessionId"
+
+// MetadataKeySessionMode is the SessionRef.Metadata key that carries the
+// current session mode (e.g. "chat" or "tui").
+const MetadataKeySessionMode = "sessionMode"
 
 // MetadataKeyTitle and MetadataKeySummary are the SessionRef.Metadata keys
 // carrying a session's human title and one-line summary. They are the shared
@@ -213,6 +689,12 @@ type LaunchConfig struct {
 	Permissions PermissionMode
 	Prompt      string
 	SessionID   string
+	// NativeSessionID optionally asks an adapter that supports caller-assigned
+	// native identities to use this id for a fresh provider conversation. It is
+	// deliberately separate from SessionID: one stable AO session may create
+	// several provider-native conversations over its lifetime. Adapters whose
+	// CLI assigns native ids ignore this field and report the id through hooks.
+	NativeSessionID string
 	// AllowedTools and DisallowedTools scope the agent to a tool allowlist when
 	// it runs in a non-bypass permission mode (allow rules auto-approve, deny
 	// rules auto-reject). They are the enforced read-only guarantee the reviewer
@@ -239,11 +721,18 @@ type WorkspaceHookConfig struct {
 
 // RestoreConfig carries inputs needed to continue an existing native agent session.
 type RestoreConfig struct {
-	Config      AgentConfig
-	DataDir     string
-	Kind        domain.SessionKind
-	Permissions PermissionMode
-	Session     SessionRef
+	Config          AgentConfig
+	DataDir         string
+	Kind            domain.SessionKind
+	Permissions     PermissionMode
+	AllowedTools    []string
+	DisallowedTools []string
+	Session         SessionRef
+	// Prompt is an optional new user turn to submit while resuming the native
+	// conversation. Adapters whose CLI accepts a resume-time positional prompt
+	// should append it to the restore command; after-start adapters leave it
+	// empty and receive the turn through the interactive terminal instead.
+	Prompt string
 	// SystemPrompt carries the session's standing instructions (e.g. the
 	// orchestrator role). Agent CLIs rebuild their system prompt from flags on
 	// resume — it is not part of the transcript — so adapters whose CLI has a
@@ -257,6 +746,9 @@ type SessionRef struct {
 	ID            string
 	Metadata      map[string]string
 	WorkspacePath string
+	// DataDir is AO's isolated state root. Native lifecycle commands must use it
+	// as their stable working/configuration root, never the session worktree.
+	DataDir string
 }
 
 // SessionInfo contains agent-owned session metadata.

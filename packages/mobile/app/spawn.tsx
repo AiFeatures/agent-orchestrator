@@ -1,338 +1,527 @@
-import { Feather } from "@expo/vector-icons";
-import { useRouter } from "expo-router";
-import { useEffect, useMemo, useState } from "react";
+import { useLocalSearchParams, useRouter } from "expo-router";
+import { Feather } from "../lib/icons";
+import BottomSheet, { BottomSheetView } from "@expo/ui/community/bottom-sheet";
+import * as DocumentPicker from "expo-document-picker";
+import { File } from "expo-file-system";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	InteractionManager,
-	KeyboardAvoidingView,
-	Modal,
 	Platform,
 	Pressable,
 	ScrollView,
 	StyleSheet,
 	Text,
-	TextInput,
 	View,
 } from "react-native";
-import { getAgents, refreshAgents, type AgentCatalog, type AgentInfo } from "../lib/api";
+import { KeyboardStickyView, useKeyboardState } from "react-native-keyboard-controller";
+import { agentErrorCopy } from "../lib/agentError";
+import { defaultAgent, rankAgents } from "../lib/agentPicker";
+import { ApiError, getAgentModels, getAgents, getProject, getSettings, type AgentCatalog, type AgentModelCatalog, type ProjectDetail, type SessionMode } from "../lib/api";
+import { userFacingError } from "../lib/connectionError";
+import { chatErrorCopy, isChatPreflightError } from "../lib/chatError";
 import { haptics } from "../lib/haptics";
+import { connectedSpawnHosts, initialSpawnHostId, selectSpawnHost, spawnHostRequestIsCurrent } from "../lib/hostRoute";
+import { ALL_PROJECTS, STANDALONE_PROJECT, resolveSpawnProject } from "../lib/projectFilter";
+import { modelOverride, resolveSpawnAgent, resolveSpawnModel, spawnModelSourceChanged } from "../lib/spawnModel";
+import { appendSpawnAttachments, readSpawnAttachments, type SpawnAttachment } from "../lib/spawn-attachments";
+import { SpawnComposerControls } from "../lib/spawn-composer-controls";
+import { spawnNotices } from "../lib/spawnNotices";
+import { SpawnPromptInput } from "../lib/spawn-prompt-input";
 import { useApp } from "../lib/store";
-import { theme } from "../lib/theme";
+import { useVoiceInput } from "../lib/voice/useVoiceInput";
+import type { Theme } from "../lib/theme";
+import { useTheme, useThemedStyles } from "../lib/ThemeProvider";
 import { Button } from "../lib/ui";
+import { iconSize, space, type } from "../lib/tokens";
+import { backOr } from "../lib/backNavigation";
 
-type RankedAgent = AgentInfo & {
-	rank: number;
-	reason: string;
-	selectable: boolean;
-};
-
-function rankAgents(catalog: AgentCatalog): RankedAgent[] {
-	const authorizedIds = new Set(catalog.authorized.map((a) => a.id));
-	const installedById = new Map(catalog.installed.map((a) => [a.id, a]));
-	return catalog.supported
-		.map((agent) => {
-			const installed = installedById.get(agent.id);
-			const authStatus = installed?.authStatus;
-			const isAuthorized = authorizedIds.has(agent.id) || authStatus === "authorized";
-			const isAuthUnknown = !!installed && !isAuthorized && authStatus !== "unauthorized";
-			const isSelectable = isAuthorized || isAuthUnknown;
-			const rank = isAuthorized ? 0 : isAuthUnknown ? 1 : installed ? 2 : 3;
-			const reason = !installed ? "Needs install" : isAuthUnknown ? "Auth unknown" : !isAuthorized ? "Needs auth" : "";
-			return { ...agent, rank, reason, selectable: isSelectable };
-		})
-		.sort((a, b) => a.rank - b.rank || a.label.localeCompare(b.label));
-}
+export { SheetErrorBoundary as ErrorBoundary } from "../lib/RouteErrorBoundary";
 
 export default function SpawnModal() {
+	return <SpawnModalContent />;
+}
+
+function SpawnModalContent() {
+	const t = useTheme();
+	const styles = useThemedStyles(makeStyles);
 	const router = useRouter();
-	const { projects, activeProjectId, config, spawn } = useApp();
+	const { projectId: routeProjectId, hostId: routeHostId } = useLocalSearchParams<{ projectId?: string; hostId?: string }>();
+	const { hostStates, activeProjectId, currentHostId, configForHost, switchHost, setActiveProject, spawn } = useApp();
+	const connectedHosts = useMemo(() => connectedSpawnHosts(hostStates), [hostStates]);
+	const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+	const hostSelectionInitialized = useRef(false);
+	const catalogGeneration = useRef(0);
+	const selectedHost = hostStates.find((host) => host.hostId === selectedHostId);
+	const config = selectedHostId ? configForHost(selectedHostId) : null;
+	const projects = selectedHost?.projects ?? [];
+	const projectsKnown = selectedHost?.projectsKnown ?? false;
+	const connection = selectedHost?.connection ?? "closed";
+	const unreachable = Boolean(selectedHost && selectedHost.connection === "closed");
+	const hostOptions = useMemo(() => {
+		if (!selectedHostId || connectedHosts.some((host) => host.id === selectedHostId)) return connectedHosts;
+		const selected = hostStates.find((host) => host.hostId === selectedHostId);
+		return selected ? [{ id: selected.hostId, label: selected.name }, ...connectedHosts] : connectedHosts;
+	}, [connectedHosts, hostStates, selectedHostId]);
+
+	useEffect(() => {
+		if (hostSelectionInitialized.current) return;
+		const routed = routeHostId ? hostStates.find((host) => host.hostId === routeHostId) : undefined;
+		if ((routeHostId && routed?.loading) || (!routeHostId && connectedHosts.length === 0 && hostStates.some((host) => host.loading))) return;
+		hostSelectionInitialized.current = true;
+		setSelectedHostId(initialSpawnHostId({ routeHostId, currentHostId: currentHostId ?? undefined, hosts: connectedHosts }));
+	}, [connectedHosts, currentHostId, hostStates, routeHostId]);
+
 	const [projectId, setProjectId] = useState<string | null>(null);
 	const [harness, setHarness] = useState("");
+	const [agentTouched, setAgentTouched] = useState(false);
+	const [mode, setMode] = useState<SessionMode>("chat");
+	const [chatHarnesses, setChatHarnesses] = useState<string[]>([]);
 	const [prompt, setPrompt] = useState("");
+	const [attachments, setAttachments] = useState<SpawnAttachment[]>([]);
+	const attachmentsRef = useRef<SpawnAttachment[]>([]);
+	const pickingAttachments = useRef(false);
+	const [attachmentError, setAttachmentError] = useState<string>();
+	const [model, setModel] = useState("");
+	const [modelTouched, setModelTouched] = useState(false);
+	const [modelCatalog, setModelCatalog] = useState<AgentModelCatalog>();
+	const [projectDetail, setProjectDetail] = useState<ProjectDetail>();
+	const [projectDetailLoadedFor, setProjectDetailLoadedFor] = useState<string | null>(null);
+	const [modelLoading, setModelLoading] = useState(false);
+	const [modelError, setModelError] = useState<string>();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const requestRef = useRef<{ payload: string; attachments: readonly SpawnAttachment[]; id: string } | undefined>(undefined);
+
 	const [catalog, setCatalog] = useState<AgentCatalog | null>(null);
+	const [catalogError, setCatalogError] = useState<string | null>(null);
 	const [loading, setLoading] = useState(true);
-	const [refreshing, setRefreshing] = useState(false);
-	const [pickerOpen, setPickerOpen] = useState(false);
+	const [offerTUI, setOfferTUI] = useState(false);
+	// Bumped to re-run the loads below after the desktop comes back.
+	const [reloadKey, setReloadKey] = useState(0);
+	// Spoken text lands in the prompt the way it does in the chat composer:
+	// appended, so dictation can extend what was typed rather than replace it.
+	const voice = useVoiceInput({ onTranscript: useCallback((spoken: string) => setPrompt((old) => old ? `${old} ${spoken}` : spoken), []) });
+	const listening = voice.state === "starting" || voice.state === "recording";
+	// iOS: the prompt fills the room above the controls. The controls translate
+	// with the keyboard, which does not reflow their siblings; a spacer below
+	// the attachments and messages makes that entire region reflow instead.
+	const [promptRoom, setPromptRoom] = useState<number>();
+	const keyboardHeight = useKeyboardState((state) => state.height);
 
-	// Default to the active project, else the only project.
-	useEffect(() => {
-		if (projectId) return;
-		if (activeProjectId !== "all") setProjectId(activeProjectId);
-		else if (projects.length === 1) setProjectId(projects[0].id);
-	}, [activeProjectId, projects, projectId]);
 
-	// Fetch agent catalog from the daemon.
+
+	// Seed from this machine's routed project, or the selected machine's active
+	// project. A project id is never carried across machines.
 	useEffect(() => {
-		if (!config) return;
+		const nextProjectId = resolveSpawnProject(
+			projectId,
+			routeHostId === selectedHostId ? routeProjectId : undefined,
+			selectedHostId === currentHostId ? activeProjectId : ALL_PROJECTS,
+			projects,
+			projectsKnown,
+		);
+		if (nextProjectId !== projectId) changeProject(nextProjectId);
+	}, [activeProjectId, currentHostId, projects, projectsKnown, projectId, routeHostId, routeProjectId, selectedHostId]);
+
+	useEffect(() => {
+		const requestedHostId = selectedHostId;
+		if (!config || !requestedHostId) { setCatalog(null); setChatHarnesses([]); setLoading(false); return; }
 		let cancelled = false;
+		const generation = catalogGeneration.current;
 		setLoading(true);
-		getAgents(config)
-			.then((c) => {
-				if (cancelled) return;
+		Promise.all([getAgents(config), getSettings(config)])
+			.then(([c, settings]) => {
+				if (cancelled || !spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) return;
 				setCatalog(c);
-				const ranked = rankAgents(c);
-				const first = ranked.find((a) => a.selectable) ?? ranked[0];
-				if (first && !harness) setHarness(first.id);
+				setChatHarnesses(settings.chatHarnesses);
+				setCatalogError(null);
 			})
-			.catch(() => {
-				if (!cancelled) setCatalog(null);
+			.catch((e) => {
+				// Previously swallowed into `catalog = null`, which left an empty
+				// picker and no way to tell the daemon was unreachable.
+				if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setCatalogError(agentErrorCopy(e));
 			})
 			.finally(() => {
-				if (!cancelled) setLoading(false);
+				if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setLoading(false);
 			});
 		return () => {
 			cancelled = true;
 		};
-	}, [config]);
+	}, [config, reloadKey, selectedHostId]);
 
-	const handleRefresh = async () => {
-		if (!config || refreshing) return;
-		setRefreshing(true);
+	// Refreshing the catalog moved into the agent sheet route, which owns its own
+	// copy of it — see app/sheets/agent.tsx.
+	const allAgents = useMemo(() => rankAgents(catalog), [catalog]);
+	const agents = useMemo(() => mode === "chat" ? allAgents.filter((agent) => chatHarnesses.includes(agent.id)) : allAgents, [allAgents, chatHarnesses, mode]);
+	const projectWorkerAgent = projectDetail?.config?.worker?.agent ?? projectDetail?.agent ?? "";
+	const projectWorkerModel = projectDetail?.config?.worker?.agentConfig?.model ?? projectDetail?.config?.agentConfig?.model ?? "";
+	const resolvedModel = resolveSpawnModel({ selectedAgent: harness, projectWorkerAgent, projectWorkerModel });
+	const displayedModel = modelTouched ? model : resolvedModel;
+	// "Automatic" when the project pins nothing, because that is the truth: the
+	// provider picks, and naming a model here promised one the session never ran.
+	const displayedModelLabel = displayedModel ? modelCatalog?.models.find((item) => item.id === displayedModel)?.label ?? displayedModel : "Automatic";
+	const modelSelection = modelTouched ? model : "__auto__";
+	const hostNotices = selectedHostId === null && hostSelectionInitialized.current
+		? [routeHostId ? "That machine is not connected." : "No connected machines are available."]
+		: [];
+	const notices = [...hostNotices, ...spawnNotices({
+		// Only when a reconnect can fix it: a rejected password stops the poll for
+		// good, and its catalog error already says to re-scan the pairing code.
+		offline: unreachable,
+		mode,
+		loading,
+		catalogLoaded: catalog !== null,
+		catalogError,
+		agentCount: agents.length,
+		modelError,
+	})];
+	const hasComposerMessage = Boolean(
+		notices.length > 0
+		|| attachmentError
+		|| (Platform.OS === "android" && listening)
+		|| voice.error
+		|| error
+		|| offerTUI,
+	);
+
+	useEffect(() => {
+		const requestedHostId = selectedHostId;
+		if (!config || !requestedHostId || !projectId || projectId === STANDALONE_PROJECT) { setProjectDetail(undefined); setProjectDetailLoadedFor(null); return; }
+		let cancelled = false;
+		const generation = catalogGeneration.current;
+		setProjectDetailLoadedFor(null);
+		getProject(config, projectId)
+			.then((nextProject) => { if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setProjectDetail(nextProject); })
+			.catch((cause) => { if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setModelError(userFacingError(cause)); })
+			.finally(() => { if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setProjectDetailLoadedFor(projectId); });
+		return () => { cancelled = true; };
+	}, [config, projectId, reloadKey, selectedHostId]);
+
+	useEffect(() => {
+		if (agentTouched || loading || !catalog) return;
+		if (projectId && projectId !== STANDALONE_PROJECT && projectDetailLoadedFor !== projectId) return;
+		const nextHarness = resolveSpawnAgent({
+			projectWorkerAgent: projectDetail?.config?.worker?.agent,
+			projectAgent: projectDetail?.agent,
+			availableAgents: agents.filter((agent) => agent.selectable).map((agent) => agent.id),
+		});
+		setHarness((current) => current === nextHarness ? current : nextHarness);
+	}, [agentTouched, agents, catalog, loading, projectDetail, projectDetailLoadedFor, projectId]);
+
+	useEffect(() => {
+		const requestedHostId = selectedHostId;
+		if (!config || !requestedHostId || !projectId || !harness) { setModelCatalog(undefined); setModelLoading(false); return; }
+		let cancelled = false;
+		const generation = catalogGeneration.current;
+		setModelLoading(true);
+		getAgentModels(config, harness, projectId === STANDALONE_PROJECT ? undefined : projectId)
+			.then((nextCatalog) => { if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) { setModelCatalog(nextCatalog); setModelError(nextCatalog.warning); } })
+			.catch((cause) => { if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setModelError(userFacingError(cause)); })
+			.finally(() => { if (!cancelled && spawnHostRequestIsCurrent(generation, catalogGeneration.current, requestedHostId, selectedHostId)) setModelLoading(false); });
+		return () => { cancelled = true; };
+	}, [config, harness, projectId, reloadKey, selectedHostId]);
+
+	// Loads that failed while the desktop was unreachable run again once the
+	// board's poll reconnects. Keyed on the reconnect, not on the errors, so an
+	// endpoint that keeps failing while connected can't loop.
+	const previousConnection = useRef(connection);
+	useEffect(() => {
+		const reconnected = previousConnection.current !== "open" && connection === "open";
+		previousConnection.current = connection;
+		if (reconnected && (catalogError || modelError)) setReloadKey((key) => key + 1);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [connection]);
+
+	const clearModelOverride = () => { setModel(""); setModelTouched(false); };
+	const resetModelSource = () => { clearModelOverride(); setModelCatalog(undefined); setModelError(undefined); };
+	const chooseHost = (nextHostId: string) => {
+		if (nextHostId === selectedHostId) return;
+		catalogGeneration.current += 1;
+		setProjectId(null);
+		setHarness("");
+		setAgentTouched(false);
+		setCatalog(null);
+		setCatalogError(null);
+		setChatHarnesses([]);
+		setProjectDetail(undefined);
+		setProjectDetailLoadedFor(null);
+		setModelLoading(false);
+		resetModelSource();
+		setError(null);
+		setOfferTUI(false);
+		requestRef.current = undefined;
+		void selectSpawnHost(nextHostId, { select: setSelectedHostId, persistDefault: switchHost })
+			.catch(() => setError("Could not make that machine the default. Try again."));
+	};
+	const changeProject = (nextProjectId: string | null) => {
+		if (!spawnModelSourceChanged({ projectId, agentId: harness }, { projectId: nextProjectId, agentId: harness })) return;
+		resetModelSource();
+		setProjectDetail(undefined);
+		setProjectDetailLoadedFor(null);
+		setAgentTouched(false);
+		setProjectId(nextProjectId);
+	};
+	const selectAgent = (nextHarness: string) => {
+		if (!spawnModelSourceChanged({ projectId, agentId: harness }, { projectId, agentId: nextHarness })) return;
+		resetModelSource();
+		setAgentTouched(true);
+		setHarness(nextHarness);
+	};
+	const selectMode = (nextMode: SessionMode) => {
+		if (nextMode === mode) return;
+		const nextHarness = nextMode === "chat"
+			? (chatHarnesses.includes(harness) ? harness : (defaultAgent(allAgents.filter((agent) => chatHarnesses.includes(agent.id))) ?? ""))
+			: (harness || (defaultAgent(allAgents) ?? ""));
+		if (spawnModelSourceChanged({ projectId, agentId: harness }, { projectId, agentId: nextHarness })) {
+			resetModelSource();
+			setAgentTouched(false);
+		}
+		setMode(nextMode);
+		setHarness(nextHarness);
+	};
+	const selectModel = (nextModel: string) => {
+		if (nextModel === "__auto__") {
+			clearModelOverride();
+			return;
+		}
+		setModel(nextModel);
+		setModelTouched(true);
+	};
+	const voiceFeedback = listening ? (
+		<View style={styles.voice}>
+			<Feather name="mic" size={iconSize.xs} color={t.red} />
+			<Text numberOfLines={2} style={styles.voiceText}>
+				{voice.partial || (voice.state === "starting" ? "Keep holding…" : "Listening…")}
+			</Text>
+		</View>
+	) : null;
+	const pickAttachments = async () => {
+		if (pickingAttachments.current) return;
+		pickingAttachments.current = true;
+		setAttachmentError(undefined);
 		try {
-			const c = await refreshAgents(config);
-			setCatalog(c);
-			const ranked = rankAgents(c);
-			const first = ranked.find((a) => a.selectable) ?? ranked[0];
-			if (first && !harness) setHarness(first.id);
-		} catch {
-			// keep existing catalog
+			const result = await DocumentPicker.getDocumentAsync({
+				multiple: true,
+				copyToCacheDirectory: true,
+				type: "*/*",
+			});
+			if (result.canceled) return;
+			const picked = result.assets.map((asset) => {
+				const file = new File(asset.uri);
+				return {
+					name: asset.name,
+					mimeType: asset.mimeType || "application/octet-stream",
+					bytes: asset.size ?? file.size,
+					readData: () => file.base64(),
+				};
+			});
+			const before = attachmentsRef.current;
+			const next = await readSpawnAttachments(before, picked);
+			const merged = appendSpawnAttachments(attachmentsRef.current, next.attachments.slice(before.length));
+			attachmentsRef.current = merged.attachments;
+			setAttachments(merged.attachments);
+			setAttachmentError(next.error ?? merged.error);
+		} catch (cause) {
+			setAttachmentError(userFacingError(cause, "Couldn't read that file."));
 		} finally {
-			setRefreshing(false);
+			pickingAttachments.current = false;
+
 		}
 	};
 
-	const rankedAgents = useMemo(() => (catalog ? rankAgents(catalog) : []), [catalog]);
-	const selectedAgent = rankedAgents.find((a) => a.id === harness);
-
 	const onSpawn = async () => {
-		if (!projectId) {
-			setError("Pick a project first.");
+		if (!selectedHostId || !config) {
+			setError("Choose a connected machine before starting this task.");
 			return;
 		}
+		if (pickingAttachments.current) {
+			setAttachmentError("Wait for attachments to finish loading.");
+			return;
+		}
+		// Validated on submit rather than by disabling the button — desktop's
+		// choice, and the better one: a disabled button with no explanation is
+		// worse than a message naming what is missing.
 		setBusy(true);
 		setError(null);
+		setOfferTUI(false);
 		try {
-			const session = await spawn(prompt.trim() || undefined, projectId, harness || undefined);
+			const request = {
+				hostId: selectedHostId,
+				projectId: projectId ?? undefined,
+				prompt: prompt.trim() || undefined,
+				harness: harness || undefined,
+				model: modelOverride(displayedModel, modelTouched),
+				mode,
+				attachments: attachmentsRef.current.map(({ mimeType, data }) => ({ mimeType, data })),
+			};
+			const { attachments: _, ...requestFields } = request;
+			const payload = JSON.stringify(requestFields);
+			if (requestRef.current?.payload !== payload || requestRef.current?.attachments !== attachmentsRef.current) {
+				requestRef.current = { payload, attachments: attachmentsRef.current, id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}` };
+			}
+			const session = await spawn({ ...request, clientRequestId: requestRef.current.id });
+			if (projectId === STANDALONE_PROJECT) setActiveProject(ALL_PROJECTS);
 			haptics.success();
-			// Dismiss the modal first, then open the freshly spawned session's terminal
+			// Dismiss the modal first, then open the freshly spawned session's mode-aware surface
 			// once the dismiss transition has settled. Firing both navigations in the
 			// same tick overlaps their animations (the modal retracts while the session
 			// is already sliding in); runAfterInteractions waits for the modal's
 			// transition to finish so the two happen back-to-back, not on top of each
 			// other. The session screen shows its own "connecting" state while the
 			// terminal attaches, so landing on it before the PTY is ready is expected.
-			router.back();
+			backOr(router);
 			InteractionManager.runAfterInteractions(() => {
 				router.push({
 					pathname: "/session/[id]",
-					params: { id: session.id, projectId: session.projectId },
+					params: { id: session.id, projectId: session.projectId, hostId: selectedHostId },
 				});
 			});
 		} catch (e) {
 			haptics.error();
-			setError(e instanceof Error ? e.message : "Failed to spawn agent.");
+			setError(spawnErrorCopy(e));
+			setOfferTUI(mode === "chat" && isChatPreflightError(e));
 			setBusy(false);
 		}
 	};
 
-	return (
-		<KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
-			<ScrollView contentContainerStyle={{ padding: 16 }} keyboardShouldPersistTaps="handled">
-				<Text style={styles.lead}>
-					Spawn a worker agent. It gets its own isolated workspace, then starts on the task you give it.
-				</Text>
-
-				<Text style={styles.label}>PROJECT</Text>
-				<View style={styles.chips}>
-					{projects.map((p) => (
-						<Pressable
-							key={p.id}
-							style={[styles.chip, projectId === p.id && styles.chipActive]}
-							onPress={() => {
-								haptics.select();
-								setProjectId(p.id);
-							}}
-						>
-							<Text style={[styles.chipText, projectId === p.id && styles.chipTextActive]}>{p.name}</Text>
-						</Pressable>
-					))}
+	const content = (
+		<View style={[
+			styles.content,
+			Platform.OS === "ios" && styles.iosContent,
+			Platform.OS === "android" && styles.androidContent,
+		]}>
+				<View
+					style={[styles.promptHost, Platform.OS === "ios" && styles.promptHostFill]}
+					onLayout={Platform.OS === "ios" ? (event) => setPromptRoom(Math.floor(event.nativeEvent.layout.height)) : undefined}
+				>
+					<SpawnPromptInput value={prompt} onChangeText={setPrompt} height={Platform.OS === "ios" ? promptRoom : undefined} />
 				</View>
 
-				<View style={[styles.labelRow, { marginTop: 20 }]}>
-					<Text style={styles.label}>AGENT</Text>
-					<Pressable onPress={handleRefresh} disabled={loading || refreshing}>
-						<Text style={styles.refreshLink}>{refreshing ? "Refreshing..." : "Refresh"}</Text>
-					</Pressable>
-				</View>
-
-				<Pressable style={styles.pickerTrigger} onPress={() => setPickerOpen(true)} disabled={loading}>
-					<Text style={[styles.pickerTriggerText, !selectedAgent && styles.pickerPlaceholder]}>
-						{loading ? "Loading agents..." : selectedAgent ? selectedAgent.label : "Select agent"}
-					</Text>
-					<Feather name={loading ? "loader" : "chevron-down"} size={16} color={theme.textTertiary} />
-				</Pressable>
-
-				{catalog && rankedAgents.length === 0 && (
-					<Text style={styles.hint}>No agents found. Is the daemon reachable?</Text>
-				)}
-
-				<Text style={[styles.label, { marginTop: 20 }]}>TASK (OPTIONAL)</Text>
-				<TextInput
-					style={styles.input}
-					value={prompt}
-					onChangeText={setPrompt}
-					placeholder="e.g. Fix the flaky login test and open a PR"
-					placeholderTextColor={theme.textTertiary}
-					multiline
-					autoCapitalize="sentences"
-				/>
-
-				{error ? <Text style={styles.error}>{error}</Text> : null}
-
-				<Button
-					title="Spawn agent"
-					icon="zap"
-					loading={busy}
-					onPress={onSpawn}
-					disabled={!projectId}
-					style={{ marginTop: 20 }}
-				/>
-				<Button title="Cancel" variant="ghost" onPress={() => router.back()} style={{ marginTop: 10 }} />
-			</ScrollView>
-
-			<Modal visible={pickerOpen} transparent animationType="fade" onRequestClose={() => setPickerOpen(false)}>
-				<Pressable style={styles.modalBackdrop} onPress={() => setPickerOpen(false)}>
-					<Pressable style={styles.modalCard} onPress={() => {}}>
-						<Text style={styles.modalTitle}>Select agent</Text>
-						<ScrollView style={styles.modalList} keyboardShouldPersistTaps="handled">
-							{rankedAgents.map((a) => (
+				{attachments.length ? (
+					<ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.attachments}>
+						{attachments.map((item, index) => (
+							<View key={`${item.name}-${index}`} style={styles.attachment}>
+								<Feather name="file-text" size={iconSize.sm} color={t.accent} />
+								<Text numberOfLines={1} style={styles.attachmentName}>{item.name}</Text>
 								<Pressable
-									key={a.id}
-									style={[styles.modalItem, harness === a.id && styles.modalItemActive]}
+									hitSlop={8}
+									accessibilityLabel={`Remove ${item.name}`}
 									onPress={() => {
-										if (a.selectable) {
-											haptics.select();
-											setHarness(a.id);
-											setPickerOpen(false);
-										}
+										attachmentsRef.current = attachmentsRef.current.filter((candidate) => candidate !== item);
+										setAttachments(attachmentsRef.current);
 									}}
 								>
-									<View style={{ flex: 1 }}>
-										<Text
-											style={[
-												styles.modalItemLabel,
-												harness === a.id && styles.modalItemLabelActive,
-												!a.selectable && styles.modalItemLabelMuted,
-											]}
-										>
-											{a.label}
-										</Text>
-									</View>
-									{a.reason ? (
-										<View style={styles.modalItemReasonRow}>
-											{a.reason === "Auth unknown" ? (
-												<Feather name="alert-triangle" size={12} color={theme.amber} style={{ marginRight: 4 }} />
-											) : null}
-											<Text style={[styles.modalItemReason, a.reason === "Auth unknown" && { color: theme.amber }]}>
-												{a.reason}
-											</Text>
-										</View>
-									) : harness === a.id ? (
-										<Feather name="check" size={16} color={theme.blue} />
-									) : null}
+									<Feather name="x" size={iconSize.xs} color={t.textTertiary} />
 								</Pressable>
-							))}
-						</ScrollView>
-						<Button title="Cancel" variant="ghost" onPress={() => setPickerOpen(false)} style={{ marginTop: 8 }} />
-					</Pressable>
-				</Pressable>
-			</Modal>
-		</KeyboardAvoidingView>
+							</View>
+						))}
+					</ScrollView>
+				) : null}
+
+		{hasComposerMessage ? <View style={styles.messages}>
+					{notices.map((notice) => <Text key={notice} style={styles.warn}>{notice}</Text>)}
+					{attachmentError ? <Text style={styles.warn}>{attachmentError}</Text> : null}
+					{Platform.OS === "android" ? voiceFeedback : null}
+					{voice.error ? <Text accessibilityRole="alert" style={styles.warn}>{voice.error}</Text> : null}
+					{error ? <Text style={styles.error}>{error}</Text> : null}
+					{offerTUI ? <Button title="Create as Terminal UI instead" variant="ghost" icon="terminal" onPress={() => { selectMode("tui"); setOfferTUI(false); setError(null); }} /> : null}
+				</View> : null}
+
+				{/* The sticky controls move visually but keep their original layout
+				    position. Reserve that movement before them so chips and messages
+				    remain visible above the keyboard, not behind the controls. */}
+				{Platform.OS === "ios" && keyboardHeight > 0 ? (
+					<View pointerEvents="none" style={{ height: keyboardHeight, marginTop: -space.sm }} />
+				) : null}
+
+				{/* The controls ride the keyboard on the UI thread.
+				    iOS does not lift this form sheet for the IME, and every
+				    height-based attempt moved late or not at all: a settled keyboard
+				    height only lands after the animation, animated padding is
+				    interpolated on the JS thread, and a keyboard-avoiding wrapper
+				    mismeasures its own frame inside a sheet, leaving Start task behind
+				    the keyboard. A sticky view translates by the live offset, so
+				    the selectors and the button sit directly above it. */}
+				<KeyboardStickyView offset={{ closed: 0, opened: 0 }}>
+				{Platform.OS === "ios" ? voiceFeedback : null}
+				<SpawnComposerControls
+					hosts={hostOptions}
+					hostId={selectedHostId}
+					onSelectHost={chooseHost}
+					projects={[...projects.map((item) => ({ id: item.id, label: item.name, icon: "folder" as const })), { id: STANDALONE_PROJECT, label: "Standalone agent", icon: "message-square-plus" as const, sectionBreakBefore: true }]}
+					projectId={projectId}
+					onSelectProject={changeProject}
+					agents={agents.filter((item) => item.selectable).map((item) => ({ id: item.id, label: item.label }))}
+					harness={harness}
+					onSelectHarness={selectAgent}
+					models={modelCatalog?.models.map((item) => ({ id: item.id, label: item.label })) ?? []}
+					modelSelection={modelSelection}
+					modelLabel={displayedModelLabel}
+					onSelectModel={selectModel}
+					onAttach={() => { void pickAttachments(); }}
+					voice={{ state: voice.state, mode: voice.mode, onPressIn: voice.pressIn, onPressOut: voice.pressOut }}
+					onSpawn={() => { void onSpawn(); }}
+					busy={busy}
+					disabled={!selectedHostId || !config || !projectId || !harness || busy || modelLoading || loading || listening || voice.state === "transcribing"}
+				/>
+				</KeyboardStickyView>
+		</View>
 	);
+
+	if (Platform.OS === "android") {
+		return (
+			<View style={styles.androidModalRoot}>
+				<BottomSheet
+					index={0}
+					enablePanDownToClose
+					enableDynamicSizing
+					backgroundStyle={{ backgroundColor: t.bgBase }}
+					onClose={() => backOr(router)}
+				>
+					<BottomSheetView style={styles.androidSheet}>
+						{content}
+					</BottomSheetView>
+				</BottomSheet>
+			</View>
+		);
+	}
+
+	return <View style={styles.screen}>{content}</View>;
 }
 
-const styles = StyleSheet.create({
-	screen: { flex: 1, backgroundColor: theme.bgBase },
-	lead: { color: theme.textSecondary, fontSize: 14, lineHeight: 20, marginBottom: 22 },
-	label: { color: theme.textTertiary, fontSize: 10, letterSpacing: 1, fontWeight: "700" },
-	labelRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
-	refreshLink: { color: theme.blue, fontSize: 12, fontWeight: "600" },
-	chips: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+// Human copy for a failed spawn, matching every other screen. Never the wire
+// string ("401 Unauthorized - missing or invalid connection password").
+function spawnErrorCopy(e: unknown): string {
+	if (isChatPreflightError(e)) return chatErrorCopy(e);
+	if (e instanceof ApiError && e.code === "PROMPT_TOO_LONG") {
+		return "Task prompt is too long. Keep it to 16 KiB or fewer (emoji and other non-English characters use more than one byte). Shorten it and try again.";
+	}
+	return userFacingError(e, "Couldn't start the worker. Try again.");
+}
 
-	chip: {
-		paddingHorizontal: 14,
-		paddingVertical: 7,
-		borderRadius: 20,
-		borderWidth: 1,
-		borderColor: theme.borderDefault,
-		backgroundColor: theme.bgElevated,
-	},
-	chipActive: { backgroundColor: theme.tintBlue, borderColor: theme.blue },
-	chipText: { color: theme.textSecondary, fontSize: 13, fontWeight: "600" },
-	chipTextActive: { color: theme.blue },
+// Android's compact field height and the iOS host's minimum layout height.
+const PROMPT_MIN_HEIGHT = 112;
 
-	pickerTrigger: {
-		flexDirection: "row",
-		alignItems: "center",
-		justifyContent: "space-between",
-		backgroundColor: theme.bgElevated,
-		borderColor: theme.borderDefault,
-		borderWidth: 1,
-		borderRadius: 10,
-		paddingHorizontal: 14,
-		paddingVertical: 13,
-	},
-	pickerTriggerText: { color: theme.textPrimary, fontSize: 15, fontWeight: "600", flex: 1 },
-	pickerPlaceholder: { color: theme.textTertiary, fontWeight: "400" },
-
-	hint: { color: theme.textTertiary, fontSize: 12, marginTop: 6 },
-
-	input: {
-		backgroundColor: theme.bgElevated,
-		borderColor: theme.borderDefault,
-		borderWidth: 1,
-		borderRadius: 10,
-		color: theme.textPrimary,
-		paddingHorizontal: 12,
-		paddingVertical: 12,
-		fontSize: 14,
-		minHeight: 96,
-		textAlignVertical: "top",
-	},
-	error: { color: theme.red, fontSize: 13, marginTop: 14 },
-
-	modalBackdrop: {
-		flex: 1,
-		backgroundColor: "rgba(0,0,0,0.6)",
-		alignItems: "center",
-		justifyContent: "center",
-		padding: 24,
-	},
-	modalCard: {
-		width: "100%",
-		maxWidth: 380,
-		maxHeight: "70%",
-		backgroundColor: theme.bgElevated,
-		borderRadius: 14,
-		borderWidth: 1,
-		borderColor: theme.borderDefault,
-		padding: 20,
-	},
-	modalTitle: { color: theme.textPrimary, fontSize: 17, fontWeight: "700", marginBottom: 14 },
-	modalList: { maxHeight: 320 },
-	modalItem: {
-		flexDirection: "row",
-		alignItems: "center",
-		paddingVertical: 12,
-		paddingHorizontal: 12,
-		borderRadius: 8,
-		marginBottom: 4,
-	},
-	modalItemActive: { backgroundColor: theme.tintBlue },
-	modalItemLabel: { color: theme.textPrimary, fontSize: 14, fontWeight: "600" },
-	modalItemLabelActive: { color: theme.blue },
-	modalItemLabelMuted: { color: theme.textTertiary },
-	modalItemReasonRow: { flexDirection: "row", alignItems: "center", marginLeft: 8 },
-	modalItemReason: { color: theme.textTertiary, fontSize: 11 },
-});
+const makeStyles = (t: Theme) =>
+	StyleSheet.create({
+		screen: { flex: 1, backgroundColor: t.bgBase },
+		content: { flex: 1, paddingHorizontal: space.lg, paddingTop: space.lg, paddingBottom: space.sm, gap: space.sm },
+		iosContent: { paddingTop: space.xxxl },
+		androidModalRoot: { flex: 1, backgroundColor: "transparent" },
+		androidSheet: {
+			paddingTop: space.xs,
+			paddingBottom: space.md,
+			backgroundColor: t.bgBase,
+		},
+		androidContent: { flex: 0, paddingTop: space.md, paddingBottom: space.none },
+		messages: { gap: space.xs },
+		voice: { flexDirection: "row", alignItems: "center", gap: space.xs, backgroundColor: t.tintRed, borderRadius: 8, paddingHorizontal: space.sm, paddingVertical: space.xs },
+		voiceText: { fontFamily: "Geist_400Regular", flex: 1, color: t.textSecondary, fontSize: type.caption2.fontSize },
+		promptHost: { width: "100%", height: PROMPT_MIN_HEIGHT },
+		promptHostFill: { height: undefined, flex: 1, minHeight: 0 },
+		attachments: { gap: space.sm },
+		attachment: { maxWidth: 190, height: 36, flexDirection: "row", alignItems: "center", gap: space.xs, paddingHorizontal: space.sm, borderRadius: 12, borderCurve: "continuous", backgroundColor: t.bgElevated, borderWidth: StyleSheet.hairlineWidth, borderColor: t.borderSubtle },
+		attachmentName: { fontFamily: "Geist_400Regular", flexShrink: 1, color: t.textSecondary, fontSize: type.caption1.fontSize },
+		warn: { fontFamily: "Geist_400Regular", color: t.amber, fontSize: type.footnote.fontSize, lineHeight: type.footnote.lineHeight },
+		error: { fontFamily: "Geist_400Regular", color: t.red, fontSize: type.footnote.fontSize, lineHeight: type.footnote.lineHeight },
+	});

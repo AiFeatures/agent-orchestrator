@@ -17,91 +17,6 @@ import (
 
 const reviewMaxNudge = 3
 
-// ReviewDeliveryOutcome reports what ApplyReviewResult did with a completed
-// AO-internal review pass.
-type ReviewDeliveryOutcome string
-
-const (
-	// ReviewDeliveryNoop means lifecycle did not send or confirm a review nudge
-	// because the result was not relevant for delivery.
-	ReviewDeliveryNoop ReviewDeliveryOutcome = "no_op"
-	// ReviewDeliverySent means the worker nudge was sent or was already covered
-	// by sendOnce dedup state and may be stamped delivered.
-	ReviewDeliverySent ReviewDeliveryOutcome = "sent"
-)
-
-// ReviewResult is the already-persisted result of an AO-internal review pass.
-// Lifecycle treats it as input to the reaction reducer; it does not write the
-// review_run row.
-type ReviewResult struct {
-	RunID          string
-	BatchID        string
-	WorkerID       domain.SessionID
-	PRURL          string
-	TargetSHA      string
-	Verdict        domain.ReviewVerdict
-	Body           string
-	GithubReviewID string
-	DeliveredAt    *time.Time
-}
-
-// ApplyReviewBatch reacts to one reviewer CLI submission after the review
-// service has decided which current-head changes-requested results are
-// deliverable.
-func (m *Manager) ApplyReviewBatch(ctx context.Context, workerID domain.SessionID, batchID string, results []ReviewResult) (ReviewDeliveryOutcome, error) {
-	if batchID == "" || len(results) == 0 {
-		return ReviewDeliveryNoop, nil
-	}
-	rec, ok, err := m.store.GetSession(ctx, workerID)
-	if err != nil || !ok {
-		return ReviewDeliveryNoop, err
-	}
-	if cannotNudge(rec) {
-		return ReviewDeliveryNoop, nil
-	}
-	if m.guard == nil {
-		return ReviewDeliveryNoop, nil
-	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].PRURL != results[j].PRURL {
-			return results[i].PRURL < results[j].PRURL
-		}
-		return results[i].RunID < results[j].RunID
-	})
-	var msg strings.Builder
-	fmt.Fprintf(&msg, "[AO reviewer] AO's internal code reviewer submitted %d review(s) requesting changes.\n", len(results))
-	var sigParts []string
-	for i, r := range results {
-		fmt.Fprintf(&msg, "\nReview %d\nPR: %s\nVerdict: %s", i+1, domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
-		if r.TargetSHA != "" {
-			fmt.Fprintf(&msg, "\nHead commit: %s", domain.SanitizeControlChars(r.TargetSHA))
-		}
-		if r.GithubReviewID != "" {
-			safeReviewID := domain.SanitizeControlChars(r.GithubReviewID)
-			fmt.Fprintf(&msg, "\nGitHub review: %s", safeReviewID)
-			fmt.Fprintf(&msg, "\nOnce you have addressed it, reply on GitHub review %s with how you addressed it, then resolve the review comment threads you addressed.", safeReviewID)
-		}
-		if r.Body != "" {
-			fmt.Fprintf(&msg, "\n\nReview body:\n%s\n", domain.SanitizeControlChars(r.Body))
-		}
-		sigParts = append(sigParts, strings.Join([]string{r.RunID, r.PRURL, r.TargetSHA, r.GithubReviewID, r.Body}, "\x00"))
-	}
-	anchorPR := results[0].PRURL
-	key := "review-batch:" + anchorPR + ":" + batchID
-	sig := strings.Join(sigParts, "\x01")
-	outcome, err := m.sendOnce(ctx, workerID, anchorPR, key, sig, msg.String(), reviewMaxNudge)
-	if err != nil {
-		return ReviewDeliveryNoop, err
-	}
-	if outcome == sendOnceSuppressed {
-		// The worker went terminated/exited/needs-input between the entry guard and the
-		// paste: nothing reached it, so do NOT let the caller stamp the run
-		// delivered — it must re-fire once the session is workable again.
-		return ReviewDeliveryNoop, nil
-	}
-	return ReviewDeliverySent, nil
-}
-
 type reactionState struct {
 	mu       sync.Mutex
 	seen     map[string]string
@@ -110,10 +25,17 @@ type reactionState struct {
 	// seen/attempts during this process. Lazy: we only pay the DB read on the
 	// first reaction touching each PR after startup.
 	loaded map[string]bool
+	// pendingRearm tracks PR URLs whose merge-conflict re-arm has been applied
+	// in memory but whose durable write failed. The in-memory delete stands (a
+	// conflict returning in this process must still nudge), so without this the
+	// next re-arm would see nothing armed, take the early return, and never
+	// retry the store — leaving the stale "conflicting" signature on disk to
+	// suppress the nudge after a restart. Cleared once the write lands.
+	pendingRearm map[string]bool
 }
 
 func newReactionState() reactionState {
-	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, loaded: map[string]bool{}}
+	return reactionState{seen: map[string]string{}, attempts: map[string]int{}, loaded: map[string]bool{}, pendingRearm: map[string]bool{}}
 }
 
 // reactionPayload is the JSON document persisted in pr.last_nudge_signature.
@@ -133,6 +55,12 @@ type pendingNudge struct {
 	sig         string
 	msg         string
 	maxAttempts int
+	// urgent routes the send through sessionguard.NudgeUrgent instead of
+	// Nudge: it still reaches a session idle at a needs-input prompt instead
+	// of being suppressed until the agent resumes. Reserved for the
+	// merge-conflict nudge (see ApplyPRObservation) — every other nudge type
+	// keeps the ordinary Nudge gate.
+	urgent bool
 }
 
 // ApplyPRObservation reacts to a fetched PR observation after the PR service has
@@ -142,6 +70,13 @@ type pendingNudge struct {
 func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o ports.PRObservation) error {
 	if !o.Fetched {
 		return nil
+	}
+	// A PR observation is this session's earliest opportunity to durably record
+	// "this session produced a PR" — reconcile immediately rather than waiting
+	// for the artifact-output poller's next tick. A failure here must not
+	// swallow the nudge delivery below, so it is logged, not returned.
+	if err := m.ReconcileSessionOutputType(ctx, id); err != nil {
+		slog.Default().Warn("lifecycle: reconcile session output type", "session", id, "err", err)
 	}
 	// A PR reaching a terminal state (merged or closed) no longer ends the
 	// session on its own: a session may own several PRs. Terminate only when no
@@ -154,6 +89,22 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			return err
 		}
 		if rec.IsTerminated || !rec.TerminateOnPRMerge {
+			return nil
+		}
+		// A merge must not race the still-working agent (#2879). A session whose
+		// agent is still ActivityActive is genuinely mid-climb: with one PR merged
+		// it is very likely raising the next PR in the same session, and
+		// flag-terminating it now (#2811's flag-only lane) would drop it from the
+		// SCM observer roster — the follow-up PR would never be attributed,
+		// enriched, or nudged alert. Defer the completed-session teardown until the
+		// agent has actually quiesced: the observer keeps polling this live session
+		// regardless because it is still observed, so the next observation of the
+		// still-merged PR re-runs this reaction after the agent exits and lands the
+		// termination then. The is_terminated / needs-input dead-session gates that
+		// the rest of reactions.go consults (see ApplyRuntimeObservation) still
+		// bound this lane at each poll; only the "sessionComplete reads PR rows"
+		// bar must additionally wait on genuine agent quiescence.
+		if rec.Activity.State == domain.ActivityActive {
 			return nil
 		}
 		done, err := m.sessionComplete(ctx, id)
@@ -169,9 +120,41 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	if err != nil || !ok {
 		return err
 	}
-	if cannotNudge(rec) {
-		return nil
+	// Re-arm the merge-conflict dedup on a definitively-cleared observation
+	// BEFORE the dead-session delivery gate below. Re-arming is non-delivery
+	// bookkeeping — it only drops this PR's dedup entry in the store, it writes
+	// nothing to a pane — so it must run even for a session that has exited or is
+	// terminated. Otherwise conflicting -> agent exits -> mergeable -> agent
+	// restored -> conflicting keeps the durable "conflicting" signature and
+	// sendOnce swallows the recurrence: exited sessions are still polled, and a
+	// terminated session that is later restored resumes polling, so the cleared
+	// state must land regardless of current liveness. The error is deferred past
+	// the nudge send loop (returned as rearmErr) so a persist failure here cannot
+	// discard CI/review nudges an unstable PR still queues below.
+	var rearmErr error
+	if mergeabilityClearsConflict(o.Mergeability) {
+		rearmErr = m.rearmMergeConflict(ctx, o.URL)
 	}
+	// A genuinely dead session — terminated, or its pane already exited to a
+	// shell — has nowhere to deliver any nudge, merge-conflict included, so
+	// return once the non-delivery re-arm above has run.
+	if rec.IsTerminated || rec.Activity.State == domain.ActivityExited {
+		return rearmErr
+	}
+	// cannotNudge's remaining condition, needs-input, defers CI-failure and
+	// review-feedback nudges until the agent is active again: both are
+	// actionable only by the agent, so re-surfacing them once it resumes loses
+	// nothing. A merge conflict is different — the human parked at the
+	// needs-input prompt may be exactly who needs to act (rebase it themselves,
+	// or redirect the agent), so the merge-conflict nudge below is deliberately
+	// exempted from this gate instead of loosening it for every nudge type. It
+	// still funnels through sendOnce's urgent path (sessionguard.NudgeUrgent),
+	// which refuses while the session is blocked on a live permission dialog and
+	// while it sits at a waiting_input prompt on a harness that cannot prove that
+	// prompt is a genuine idle composer rather than a masked permission decision
+	// (the urgentNudgeWaitingInputSafe gate) — so only a provably-idle needs-input
+	// prompt is pasted into unsolicited.
+	needsInput := rec.Activity.State.NeedsInput()
 	// A single PR can trip several actionable conditions at once (failing CI,
 	// unresolved review comments, a merge conflict). Queue every applicable nudge
 	// and send them together, so each surfaces independently instead of one
@@ -181,35 +164,82 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	// persisted their own dedup signature so the next poll retries only the rest.
 	ident := prIdentity(o)
 	var nudges []pendingNudge
+	var ciPolicyErr error
 
-	if o.CI == domain.CIFailing {
-		checks := failedPRChecks(o.Checks)
-		if len(checks) > 0 {
-			msg := formatCIFailureMessage(checks)
-			if ident != "your PR" {
-				msg = strings.Replace(msg, "your PR", ident, 1)
+	if !needsInput {
+		reviews, err := m.store.ListPRReviews(ctx, o.URL)
+		if err != nil {
+			return fmt.Errorf("list persisted reviews for %s: %w", o.URL, err)
+		}
+		comments, err := m.store.ListPRComments(ctx, o.URL)
+		if err != nil {
+			return fmt.Errorf("list persisted comments for %s: %w", o.URL, err)
+		}
+		o.Comments = prCommentObservations(comments)
+
+		if o.CI == domain.CIFailing {
+			pr, ok, err := m.store.GetPR(ctx, o.URL)
+			switch {
+			case err != nil:
+				ciPolicyErr = fmt.Errorf("load CI injection policy for %s: %w", o.URL, err)
+			case !ok:
+				ciPolicyErr = fmt.Errorf("load CI injection policy for %s: PR not found", o.URL)
+			case pr.AutoInjectCI:
+				checks := failedPRChecks(o.Checks)
+				if len(checks) > 0 {
+					msg := formatCIFailureMessage(checks)
+					if ident != "your PR" {
+						msg = strings.Replace(msg, "your PR", ident, 1)
+					}
+					if o.URL != "" {
+						msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
+					}
+					nudges = append(nudges, pendingNudge{key: "ci:" + o.URL, sig: ciFailureSignature(checks), msg: msg, maxAttempts: 0})
+				}
 			}
-			if o.URL != "" {
-				msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
+		}
+
+		if hasUnresolvedComments(o.Comments) {
+			comments := unresolvedReviewComments(o.Comments)
+			for _, comment := range comments {
+				if !comment.AutoInjectReview {
+					continue
+				}
+				commentSlice := []ports.PRCommentObservation{comment}
+				msg := formatReviewCommentsMessage(commentSlice)
+				if ident != "your PR" {
+					msg = strings.Replace(msg, "your PR", ident, 1)
+				}
+				if o.URL != "" {
+					msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
+				}
+				sig := reviewCommentsSignature(commentSlice)
+				if sig == "" {
+					sig = string(o.Review)
+				}
+				// Per comment, like the review loop below: a shared key is a
+				// shared signature slot and a shared attempt budget.
+				nudges = append(nudges, pendingNudge{key: commentNudgeKey(o.URL, comment), sig: sig, msg: msg, maxAttempts: reviewMaxNudge})
 			}
-			nudges = append(nudges, pendingNudge{key: "ci:" + o.URL, sig: ciFailureSignature(checks), msg: msg, maxAttempts: 0})
+		}
+
+		if o.Review == domain.ReviewChangesRequest {
+			for _, review := range reviews {
+				if review.State != domain.ReviewChangesRequest || !review.AutoInjectReview {
+					continue
+				}
+				msg := formatReviewChangesRequestedMessage(review)
+				if ident != "your PR" {
+					msg = strings.Replace(msg, "your PR", ident, 1)
+				}
+				if o.URL != "" && review.URL == "" {
+					msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
+				}
+				nudges = append(nudges, pendingNudge{key: "review:" + o.URL + ":" + review.ID, sig: string(review.State), msg: msg, maxAttempts: reviewMaxNudge})
+			}
 		}
 	}
-	if o.Review == domain.ReviewChangesRequest || hasUnresolvedComments(o.Comments) {
-		comments := unresolvedReviewComments(o.Comments)
-		msg := formatReviewCommentsMessage(comments)
-		if ident != "your PR" {
-			msg = strings.Replace(msg, "your PR", ident, 1)
-		}
-		if o.URL != "" {
-			msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
-		}
-		sig := reviewCommentsSignature(comments)
-		if sig == "" {
-			sig = string(o.Review)
-		}
-		nudges = append(nudges, pendingNudge{key: "review:" + o.URL, sig: sig, msg: msg, maxAttempts: reviewMaxNudge})
-	}
+
 	// Only the merge-conflict nudge needs a store read (the parent-stack check).
 	// A read error there must NOT discard the CI/review nudges already queued
 	// above — returning early here would re-introduce the "one condition
@@ -233,21 +263,34 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 			if o.URL != "" {
 				msg += "\nPR: " + domain.SanitizeControlChars(o.URL)
 			}
-			nudges = append(nudges, pendingNudge{key: "merge-conflict:" + o.URL, sig: string(o.Mergeability), msg: msg, maxAttempts: 0})
+			nudges = append(nudges, pendingNudge{key: mergeConflictKey(o.URL), sig: string(o.Mergeability), msg: msg, maxAttempts: 0, urgent: true})
 		}
 	}
+	// The definitively-cleared re-arm (#4528) runs above the dead-session gate,
+	// not here, so an exited/restored session still drops its stale "conflicting"
+	// signature; rearmErr is surfaced at the end of this function alongside the
+	// other deferred read errors.
 
 	for _, n := range nudges {
-		if _, err := m.sendOnce(ctx, id, o.URL, n.key, n.sig, n.msg, n.maxAttempts); err != nil {
+		if _, err := m.sendOnce(ctx, id, o.URL, n.key, n.sig, n.msg, n.maxAttempts, n.urgent); err != nil {
 			return err
 		}
 	}
-	// Surface a deferred parent-stack read error only after the independent
-	// CI/review nudges have been sent, so none of them are lost to it.
-	return blockedCheckErr
+	// Surface deferred policy/parent-stack read errors only after independent
+	// nudges have been sent, so one failed lookup cannot hide another reaction.
+	if ciPolicyErr != nil {
+		return ciPolicyErr
+	}
+	if blockedCheckErr != nil {
+		return blockedCheckErr
+	}
+	return rearmErr
 }
 
 func (m *Manager) terminateCompletedSession(ctx context.Context, id domain.SessionID) error {
+	if m.sessionMutationInProgress(id) {
+		return nil
+	}
 	m.mu.Lock()
 	terminator := m.completionTerminator
 	m.mu.Unlock()
@@ -258,47 +301,6 @@ func (m *Manager) terminateCompletedSession(ctx context.Context, id domain.Sessi
 		return fmt.Errorf("terminate completed session %s: %w", id, err)
 	}
 	return nil
-}
-
-// ApplyReviewResult reacts to a completed AO-internal review pass after the
-// review service has persisted the run result. It mirrors ApplyPRObservation:
-// no change_log reads, no review_run writes, only lifecycle side effects.
-func (m *Manager) ApplyReviewResult(ctx context.Context, workerID domain.SessionID, r ReviewResult) (ReviewDeliveryOutcome, error) {
-	if r.Verdict != domain.VerdictChangesRequested || r.DeliveredAt != nil {
-		return ReviewDeliveryNoop, nil
-	}
-	rec, ok, err := m.store.GetSession(ctx, workerID)
-	if err != nil || !ok {
-		return ReviewDeliveryNoop, err
-	}
-	if cannotNudge(rec) {
-		return ReviewDeliveryNoop, nil
-	}
-	if m.guard == nil {
-		return ReviewDeliveryNoop, nil
-	}
-	msg := fmt.Sprintf("[AO reviewer] AO's internal code reviewer submitted a review.\n\nPR: %s\nVerdict: %s", domain.SanitizeControlChars(r.PRURL), domain.SanitizeControlChars(string(r.Verdict)))
-	if r.GithubReviewID != "" {
-		safeReviewID := domain.SanitizeControlChars(r.GithubReviewID)
-		msg += fmt.Sprintf("\nGitHub review: %s", safeReviewID)
-		msg += fmt.Sprintf("\n\nOnce you have addressed it, reply on GitHub review %s with how you addressed it, then resolve the review comment threads you addressed.", safeReviewID)
-	}
-	if r.Body != "" {
-		msg += "\n\nReview body:\n" + domain.SanitizeControlChars(r.Body)
-	}
-	key := "review:" + r.PRURL + ":ao:" + r.RunID
-	sig := strings.Join([]string{r.TargetSHA, r.RunID, r.GithubReviewID, r.Body}, "\x00")
-	outcome, err := m.sendOnce(ctx, workerID, r.PRURL, key, sig, msg, reviewMaxNudge)
-	if err != nil {
-		return ReviewDeliveryNoop, err
-	}
-	if outcome == sendOnceSuppressed {
-		// Suppressed by the just-in-time guard (worker went terminated/exited/needs-
-		// input): the review feedback did not reach the worker, so leave the run
-		// undelivered to re-fire on the next observation.
-		return ReviewDeliveryNoop, nil
-	}
-	return ReviewDeliverySent, nil
 }
 
 // sessionComplete reports whether the session has reached the multi-PR
@@ -319,6 +321,92 @@ func (m *Manager) sessionComplete(ctx context.Context, id domain.SessionID) (boo
 		}
 	}
 	return merged, nil
+}
+
+// commentNudgeKey identifies one review comment's nudge. It must be unique per
+// comment, not per thread: the observer expands a thread into one comment row
+// each (observer.go), all sharing the thread id, so keying on the thread would
+// put several comments with several signatures back in one dedup slot -- the
+// rotation this key exists to prevent. A comment with no id falls back to its
+// thread, which is still better than colliding with every other comment.
+func commentNudgeKey(prURL string, comment ports.PRCommentObservation) string {
+	id := strings.TrimSpace(comment.ID)
+	if id == "" {
+		id = strings.TrimSpace(comment.ThreadID)
+	}
+	return "comment:" + prURL + ":" + id
+}
+
+// mergeConflictKey is the reaction-dedup key for a PR's merge-conflict nudge.
+// The send path and the re-arm path share it so the two cannot drift.
+func mergeConflictKey(prURL string) string { return "merge-conflict:" + prURL }
+
+// mergeabilityClearsConflict reports whether an observation positively
+// establishes that a PR is no longer conflicting, which is what re-arms its
+// merge-conflict nudge (#4528).
+//
+// Only states the provider actually computed count. `unknown` is the transient
+// GitHub reports while it recomputes mergeability after a push or a retarget;
+// re-arming on it would defeat the dedup entirely, since a conflict that never
+// went away flaps unknown → conflicting and would re-nudge on every poll.
+// `blocked` is excluded on the same grounds even though it is not literally a
+// conflict: the observer synthesizes it locally from draft / failing-CI /
+// changes-requested facts (see mergeabilityFromProviderFacts), so it is reported
+// even while provider mergeability is still unknown and cannot be read as proof
+// the conflict is gone. `mergeable` and `unstable` both require a computed
+// provider rollup that ruled conflicts out first, so both are definitive.
+func mergeabilityClearsConflict(state domain.Mergeability) bool {
+	return state == domain.MergeMergeable || state == domain.MergeUnstable
+}
+
+// rearmMergeConflict clears the merge-conflict dedup entry for prURL so a later
+// conflicting observation notifies again. sendOnce otherwise keeps the
+// "merge-conflict:<url>" = "conflicting" signature forever: a PR rebased clean
+// and then made conflicting again by a base-branch advance stayed silent, and
+// because the signature is persisted in pr.last_nudge_signature the suppression
+// survived daemon restarts (#4528).
+//
+// Only this PR's merge-conflict key is touched, so the CI and review-feedback
+// entries for the same PR keep their signatures and resolving a conflict cannot
+// replay unrelated nudges. The persisted payload is loaded first: after a
+// restart the in-memory maps are empty, and persisting from them alone would
+// erase every other key the PR row still holds.
+func (m *Manager) rearmMergeConflict(ctx context.Context, prURL string) error {
+	if m.guard == nil || prURL == "" {
+		return nil
+	}
+	m.react.mu.Lock()
+	defer m.react.mu.Unlock()
+
+	if !m.react.loaded[prURL] {
+		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			return err
+		}
+		m.react.loaded[prURL] = true
+	}
+	key := mergeConflictKey(prURL)
+	_, seen := m.react.seen[key]
+	_, attempted := m.react.attempts[key]
+	if !seen && !attempted && !m.react.pendingRearm[prURL] {
+		// Nothing is armed and no earlier re-arm is still owed a durable write,
+		// so skip the store write: a steadily mergeable PR must not re-persist
+		// an unchanged payload on every poll.
+		return nil
+	}
+	delete(m.react.seen, key)
+	delete(m.react.attempts, key)
+	if err := m.persistPRSignaturesLocked(ctx, prURL); err != nil {
+		// The in-memory delete deliberately stands: a conflict returning later
+		// in this process must still nudge. But disk still holds the stale
+		// "conflicting" signature, which a restart would reload and use to
+		// suppress that nudge — the exact bug this re-arm exists to fix. Mark
+		// the PR so every later non-conflicting observation retries the write
+		// until it lands, instead of taking the early return above.
+		m.react.pendingRearm[prURL] = true
+		return err
+	}
+	delete(m.react.pendingRearm, prURL)
+	return nil
 }
 
 // prBlockedByOpenParent reports whether the PR at prURL is stacked on top of
@@ -356,15 +444,36 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	if err := m.ApplyPRObservation(ctx, id, scmToPRObservation(o)); err != nil {
 		return err
 	}
-	intent, err := m.notificationIntentForCurrentSCM(ctx, id, o)
+	ready, err := m.scmObservationReadyToMerge(ctx, o)
+	if err != nil {
+		return err
+	}
+	intent, err := m.notificationIntentForCurrentSCM(ctx, id, o, ready)
 	if err != nil {
 		return err
 	}
 	m.emitNotification(ctx, intent)
+	m.resolveNotifications(ctx, readyToMergeResolutions(id, o, ready, m.clock())...)
 	return nil
 }
 
-func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain.SessionID, o ports.SCMObservation) (*ports.NotificationIntent, error) {
+// readyToMergeResolutions reports the ready-to-merge notification this
+// observation made stale. The PR either got merged/closed, or stopped being
+// mergeable — either way the "this is ready for you to merge" ping no longer
+// describes anything the user can act on.
+func readyToMergeResolutions(id domain.SessionID, o ports.SCMObservation, ready bool, now time.Time) []ports.NotificationResolution {
+	if ready {
+		return nil
+	}
+	return []ports.NotificationResolution{{
+		Type:       domain.NotificationReadyToMerge,
+		SessionID:  id,
+		PRURL:      firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL),
+		ResolvedAt: timeOr(o.ObservedAt, now),
+	}}
+}
+
+func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain.SessionID, o ports.SCMObservation, ready bool) (*ports.NotificationIntent, error) {
 	// Serialize the session snapshot with activity transitions so ready-to-merge
 	// notifications do not race against a simultaneous waiting_input update.
 	m.mu.Lock()
@@ -376,10 +485,10 @@ func (m *Manager) notificationIntentForCurrentSCM(ctx context.Context, id domain
 	if !ok {
 		return nil, nil
 	}
-	return m.notificationIntentForSCM(rec, o), nil
+	return m.notificationIntentForSCM(rec, o, ready), nil
 }
 
-func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCMObservation) *ports.NotificationIntent {
+func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCMObservation, ready bool) *ports.NotificationIntent {
 	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
 	base := ports.NotificationIntent{
 		SessionID:          rec.ID,
@@ -402,38 +511,47 @@ func (m *Manager) notificationIntentForSCM(rec domain.SessionRecord, o ports.SCM
 		base.Type = domain.NotificationPRClosedUnmerged
 		return &base
 	}
-	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !scmObservationIsReadyToMerge(o) {
+	if rec.IsTerminated || rec.Activity.State.NeedsInput() || !ready {
 		return nil
 	}
 	base.Type = domain.NotificationReadyToMerge
 	return &base
 }
 
-func scmObservationIsReadyToMerge(o ports.SCMObservation) bool {
-	if o.PR.Merged || o.PR.Closed || o.PR.Draft {
-		return false
+// scmObservationIsReadyToMerge projects a live observation into the shared
+// readiness rule (domain.MergeReadiness). Startup reconciliation applies the
+// same rule to the stored facts, so the two paths cannot disagree about what
+// "ready to merge" means.
+func (m *Manager) scmObservationReadyToMerge(ctx context.Context, o ports.SCMObservation) (bool, error) {
+	ready := domain.MergeReadiness{
+		Draft:              o.PR.Draft,
+		Merged:             o.PR.Merged,
+		Closed:             o.PR.Closed,
+		CI:                 domain.CIState(o.CI.Summary),
+		Review:             domain.ReviewDecision(o.Review.Decision),
+		Mergeability:       domain.Mergeability(o.Mergeability.State),
+		UnresolvedComments: hasUnresolvedSCMComments(o.Review.Threads),
+	}.ReadyToMerge()
+	if !ready {
+		return false, nil
 	}
-	ci := domain.CIState(o.CI.Summary)
-	if ci == "" {
-		ci = domain.CIUnknown
+	prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+	comments, err := m.store.ListPRComments(ctx, prURL)
+	if err != nil {
+		return false, fmt.Errorf("list persisted comments for %s: %w", prURL, err)
 	}
-	switch ci {
-	case domain.CIFailing, domain.CIPending, domain.CIUnknown:
-		return false
+	for _, comment := range comments {
+		if domain.IsActionableReviewComment(comment.Resolved, comment.IsBot, comment.File, comment.Line) {
+			return false, nil
+		}
 	}
-	if domain.ReviewDecision(o.Review.Decision) == domain.ReviewChangesRequest || hasUnresolvedSCMComments(o.Review.Threads) {
-		return false
-	}
-	return domain.Mergeability(o.Mergeability.State) == domain.MergeMergeable
+	return true, nil
 }
 
 func hasUnresolvedSCMComments(threads []ports.SCMReviewThreadObservation) bool {
 	for _, th := range threads {
-		if th.Resolved || th.IsBot {
-			continue
-		}
 		for _, c := range th.Comments {
-			if !c.IsBot {
+			if domain.IsActionableReviewComment(th.Resolved, c.IsBot, th.Path, th.Line) {
 				return true
 			}
 		}
@@ -483,27 +601,29 @@ func scmToPRObservation(o ports.SCMObservation) ports.PRObservation {
 			LogTail:    logTail,
 		})
 	}
-	for _, th := range o.Review.Threads {
-		if th.Resolved || th.IsBot {
+	return pr
+}
+
+func prCommentObservations(comments []domain.PullRequestComment) []ports.PRCommentObservation {
+	out := make([]ports.PRCommentObservation, 0, len(comments))
+	for _, comment := range comments {
+		if !domain.IsActionableReviewComment(comment.Resolved, comment.IsBot, comment.File, comment.Line) {
 			continue
 		}
-		for _, c := range th.Comments {
-			if c.IsBot {
-				continue
-			}
-			pr.Comments = append(pr.Comments, ports.PRCommentObservation{
-				ID:       c.ID,
-				ThreadID: th.ID,
-				Author:   c.Author,
-				File:     th.Path,
-				Line:     th.Line,
-				Body:     c.Body,
-				URL:      c.URL,
-				Resolved: th.Resolved,
-			})
-		}
+		out = append(out, ports.PRCommentObservation{
+			ID:               comment.ID,
+			ThreadID:         comment.ThreadID,
+			ReviewID:         comment.ReviewID,
+			Author:           comment.Author,
+			File:             comment.File,
+			Line:             comment.Line,
+			Body:             comment.Body,
+			URL:              comment.URL,
+			Resolved:         comment.Resolved,
+			AutoInjectReview: comment.AutoInjectReview,
+		})
 	}
-	return pr
+	return out
 }
 
 // ApplyTrackerFacts reacts to a fetched Tracker issue observation. It owns the
@@ -527,6 +647,9 @@ func (m *Manager) ApplyTrackerFacts(ctx context.Context, id domain.SessionID, o 
 		return nil
 	}
 	if isTerminalTrackerState(o.Issue.State) {
+		if m.sessionMutationInProgress(id) {
+			return nil
+		}
 		return m.MarkTerminated(ctx, id)
 	}
 	rec, ok, err := m.store.GetSession(ctx, id)
@@ -551,7 +674,7 @@ func (m *Manager) ApplyTrackerFacts(ctx context.Context, id domain.SessionID, o 
 			// the PR-row signature load/persist is skipped, so the dedup
 			// survives only for the lifetime of this Manager. Cross-restart
 			// persistence ships with #35.
-			_, err := m.sendOnce(ctx, id, "", "tracker-bot:"+o.Issue.URL, strings.Join(ids, ","), msg, 0)
+			_, err := m.sendOnce(ctx, id, "", "tracker-bot:"+o.Issue.URL, strings.Join(ids, ","), msg, 0, false)
 			return err
 		}
 	}
@@ -561,6 +684,13 @@ func (m *Manager) ApplyTrackerFacts(ctx context.Context, id domain.SessionID, o 
 // cannotNudge is the lifecycle entry guard for automated pane delivery. The
 // just-in-time sessionguard remains authoritative, but refusing exited agents
 // here avoids repeated dedup/store work for a pane that now contains a shell.
+//
+// ApplyPRObservation does NOT call this helper directly: it needs a narrower
+// carve-out so the merge-conflict nudge alone can bypass the needs-input
+// condition below (see its needsInput comment), so it inlines the
+// terminated/exited half of this check and evaluates needs-input separately.
+// Every other nudge path in this package (ApplyTrackerFacts)
+// still gates on the full condition here, unchanged.
 func cannotNudge(rec domain.SessionRecord) bool {
 	return rec.IsTerminated || rec.Activity.State.NeedsInput() || rec.Activity.State == domain.ActivityExited
 }
@@ -704,6 +834,26 @@ func reviewCommentsSignature(comments []ports.PRCommentObservation) string {
 	return strings.Join(parts, "\x01")
 }
 
+func formatReviewChangesRequestedMessage(review domain.PullRequestReview) string {
+	var msg strings.Builder
+	author := domain.SanitizeControlChars(review.Author)
+	if strings.TrimSpace(author) == "" {
+		author = "unknown reviewer"
+	}
+	fmt.Fprintf(&msg, "A changes-requested review from @%s is on your PR.", author)
+	if body := domain.SanitizeControlChars(review.Body); strings.TrimSpace(body) != "" {
+		fmt.Fprintf(&msg, "\n\nReview body:\n%s", body)
+	}
+	if review.URL != "" {
+		fmt.Fprintf(&msg, "\n\nReview URL: %s", domain.SanitizeControlChars(review.URL))
+	}
+	if review.ID != "" {
+		fmt.Fprintf(&msg, "\nReview ID: %s", domain.SanitizeControlChars(review.ID))
+	}
+	msg.WriteString("\n\nAddress the requested changes and push. You should not need to re-fetch the review unless you need additional context beyond what AO has provided here.")
+	return msg.String()
+}
+
 func formatReviewCommentsMessage(comments []ports.PRCommentObservation) string {
 	if len(comments) == 0 {
 		return "A reviewer left feedback on your PR. Address it and push. Fetch the review details only if you need additional context beyond what AO has provided here."
@@ -776,7 +926,7 @@ const (
 	sendOnceSuppressed
 )
 
-func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key, sig, msg string, maxAttempts int) (sendOnceOutcome, error) {
+func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key, sig, msg string, maxAttempts int, urgent bool) (sendOnceOutcome, error) {
 	if m.guard == nil {
 		return sendOnceAccounted, nil
 	}
@@ -806,7 +956,19 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 	// suppresses (fail closed, nothing was written); a messenger failure means
 	// the write was attempted and stays accounted, matching the pre-guard
 	// behavior.
-	outcome, err := m.guard.Nudge(ctx, id, msg)
+	nudge := m.guard.Nudge
+	if urgent {
+		// Merge-conflict nudges (the only urgent nudge today) must still reach
+		// a session idle at a needs-input prompt; NudgeUrgent keeps refusing
+		// while a live permission dialog is on screen — including the
+		// waiting_input prompts that harnesses without a blocked signal use to
+		// represent a masked permission decision (see the urgentNudgeGate
+		// predicate). See ApplyPRObservation's needsInput carve-out.
+		nudge = func(ctx context.Context, id domain.SessionID, msg string) (sessionguard.Outcome, error) {
+			return m.guard.NudgeUrgent(ctx, id, msg, m.urgentNudgeWaitingInputSafe)
+		}
+	}
+	outcome, err := nudge(ctx, id, msg)
 	if err != nil {
 		if outcome != sessionguard.Sent {
 			return sendOnceSuppressed, err

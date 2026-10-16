@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/agent/hookutil"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/pkg/agentruntime"
 )
 
 // Codex (0.136+) never loads hook config from AO's per-session worktrees, so
@@ -61,6 +63,7 @@ type codexHookEntry struct {
 type codexHookSpec struct {
 	Event   string
 	Command string
+	Matcher string
 }
 
 // codexManagedHooks is the source of truth for the hooks AO delivers. Event
@@ -70,17 +73,58 @@ var codexManagedHooks = []codexHookSpec{
 	{Event: "SessionStart", Command: codexHookCommandPrefix + "session-start"},
 	{Event: "UserPromptSubmit", Command: codexHookCommandPrefix + "user-prompt-submit"},
 	{Event: "PermissionRequest", Command: codexHookCommandPrefix + "permission-request"},
+	// Current Codex emits the canonical `spawn_agent` tool name. Keep the
+	// historical collaboration alias while older installed Codex builds drain
+	// their sessions, so both payloads reach the parser.
+	{Event: "PostToolUse", Command: codexHookCommandPrefix + "post-tool-use", Matcher: "^(spawn_agent|collaborationspawn_agent)$"},
+	{Event: "SubagentStart", Command: codexHookCommandPrefix + "subagent-start"},
+	{Event: "SubagentStop", Command: codexHookCommandPrefix + "subagent-stop"},
 	{Event: "Stop", Command: codexHookCommandPrefix + "stop"},
 }
 
 // appendSessionHookFlags adds AO's activity hooks to the argv as `-c`
-// session-flag config, one flag per managed event.
-func appendSessionHookFlags(cmd *[]string) {
+// session-flag config, one flag per managed event. Codex executes command
+// hooks through a login shell, which may replace PATH, so every hook invokes
+// this exact AO executable instead of relying on a bare `ao` lookup.
+func appendSessionHookFlags(cmd *[]string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve AO hook executable: %w", err)
+	}
+	if !filepath.IsAbs(executable) {
+		executable, err = filepath.Abs(executable)
+		if err != nil {
+			return fmt.Errorf("make AO hook executable absolute: %w", err)
+		}
+	}
+	appendSessionHookFlagsForExecutable(cmd, executable)
+	return nil
+}
+
+func appendSessionHookFlagsForExecutable(cmd *[]string, executable string) {
+	prefix := shellQuoteHookExecutable(executable) + " hooks codex "
 	for _, spec := range codexManagedHooks {
-		flag := fmt.Sprintf(`hooks.%s=[{hooks=[{type="command",command=%s,timeout=%d}]}]`,
-			spec.Event, codexTOMLBasicString(spec.Command), codexHookTimeout)
+		action := strings.TrimPrefix(spec.Command, codexHookCommandPrefix)
+		matcher := ""
+		if spec.Matcher != "" {
+			matcher = "matcher=" + codexTOMLBasicString(spec.Matcher) + ","
+		}
+		flag := fmt.Sprintf(`hooks.%s=[{%shooks=[{type="command",command=%s,timeout=%d}]}]`,
+			spec.Event, matcher, codexTOMLBasicString(prefix+action), codexHookTimeout)
 		*cmd = append(*cmd, "-c", flag)
 	}
+}
+
+func shellQuoteHookExecutable(executable string) string {
+	if runtime.GOOS == "windows" {
+		// Codex invokes command hooks through PowerShell on Windows. A bare quoted
+		// path (`"C:\...\ao.exe"`) parses as a string expression, not an invocation,
+		// so SessionStart/UserPromptSubmit/Stop all fail before ao.exe runs
+		// ("Unexpected token 'hooks'"). Prefixing the quoted path with the call
+		// operator `& ` turns it into a command invocation that runs the binary.
+		return `& "` + executable + `"`
+	}
+	return `'` + strings.ReplaceAll(executable, `'`, `'"'"'`) + `'`
 }
 
 // appendWorkspaceTrustFlag marks the session's worktree as a trusted Codex
@@ -95,19 +139,7 @@ func appendSessionHookFlags(cmd *[]string) {
 // by the canonicalized cwd first and the literal path second (on macOS the two
 // commonly differ, e.g. /tmp vs /private/tmp).
 func appendWorkspaceTrustFlag(cmd *[]string, workspacePath string) {
-	path := strings.TrimSpace(workspacePath)
-	if path == "" {
-		return
-	}
-	keys := []string{path}
-	if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != path {
-		keys = append(keys, resolved)
-	}
-	entries := make([]string, 0, len(keys))
-	for _, key := range keys {
-		entries = append(entries, codexTOMLConfigString(key)+`={trust_level="trusted"}`)
-	}
-	*cmd = append(*cmd, "-c", "projects={"+strings.Join(entries, ",")+"}")
+	*cmd = append(*cmd, agentruntime.CodexWorkspaceTrustArgs(workspacePath)...)
 }
 
 func codexTOMLConfigString(s string) string {
@@ -152,11 +184,11 @@ func containsTOMLControl(s string) bool {
 	return false
 }
 
-// GetAgentHooks no longer installs workspace files — Codex never loads them
-// from AO's worktrees (see the package comment above); the hooks ride the
-// launch command instead. It still strips hook entries that older AO versions
-// wrote into the worktree-local .codex/hooks.json so reused or restored
-// worktrees don't keep dead AO config, preserving user-defined hooks.
+// GetAgentHooks installs no active workspace files — Codex never loads them
+// from AO's worktrees (see the package comment above); activity hooks ride the
+// launch command instead. It strips hook entries that older AO versions wrote
+// into the worktree-local .codex/hooks.json so reused or restored worktrees
+// don't keep dead AO config, preserving user-defined hooks.
 func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
 	if err := ctx.Err(); err != nil {
 		return err

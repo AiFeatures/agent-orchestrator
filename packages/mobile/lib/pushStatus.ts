@@ -10,16 +10,6 @@ export type PushStatus = {
 	registered: boolean; // we hold a token registered with a daemon
 };
 
-/** The single action offered to move push forward, if any. */
-export type PushAction = "enable" | "register" | "open-settings";
-
-export type PushDescription = {
-	label: string;
-	hint: string;
-	action: PushAction | null;
-	actionLabel: string | null;
-};
-
 /** Just enough of the server config to know whether there's a server to talk to. */
 export type ServerTarget = { host?: string } | null | undefined;
 
@@ -32,74 +22,82 @@ export function hasServer(server: ServerTarget): boolean {
 	return !!server?.host?.trim();
 }
 
+export type PushToggle = {
+	/** Where the switch sits. On means "permission granted AND registered". */
+	value: boolean;
+	/** Greyed out — there is nothing turning it on could accomplish. */
+	disabled: boolean;
+	/** Section footer explaining the current state. */
+	footer: string;
+	/**
+	 * Permission was permanently denied, so the app can no longer prompt. The
+	 * switch stays interactive (tapping must explain itself) but flipping it on
+	 * has to route through system settings instead of registerForPush.
+	 */
+	blocked: boolean;
+};
+
 /**
- * Describes push state as a label/hint plus the one action that advances it.
+ * The whole push state machine, collapsed to a single switch.
+ *
+ * The old UI exposed up to three different buttons (Enable / Register / Open
+ * settings) for what a user thinks of as one setting. All three become "on"
+ * here; only `blocked` needs different handling at the call site, because the OS
+ * won't let us re-prompt after a permanent denial.
  *
  * Takes the server config itself rather than a caller-computed boolean: passing
  * `!!config` (always true, even unpaired) was the original bug, so the "is there
  * a server" rule lives here where it is tested, not at each call site.
  */
-export function describePush(status: PushStatus | null, server: ServerTarget): PushDescription {
-	const configured = hasServer(server);
+export function describePushToggle(status: PushStatus | null, server: ServerTarget): PushToggle {
 	if (!status) {
-		return { label: "Checking…", hint: "", action: null, actionLabel: null };
+		return { value: false, disabled: true, footer: "Checking…", blocked: false };
 	}
 	if (!status.supported) {
 		return {
-			label: "Not available",
-			hint: "Push notifications need a physical device.",
-			action: null,
-			actionLabel: null,
+			value: false,
+			disabled: true,
+			footer: "Push notifications need a physical device.",
+			blocked: false,
+		};
+	}
+	if (!hasServer(server)) {
+		return {
+			value: false,
+			disabled: true,
+			footer: "Pair a machine first — notifications turn on once connected.",
+			blocked: false,
+		};
+	}
+	if (!status.granted && !status.canAskAgain) {
+		return {
+			value: false,
+			disabled: false,
+			footer: "Notifications are turned off for Orchestrator in system settings.",
+			blocked: true,
 		};
 	}
 	if (status.granted && status.registered) {
 		return {
-			label: "On",
-			hint: "You'll be alerted when an agent needs you or a PR is ready.",
-			action: null,
-			actionLabel: null,
+			value: true,
+			disabled: false,
+			footer: "You'll be alerted when an agent needs you or a PR is ready.",
+			blocked: false,
 		};
 	}
 	if (status.granted && !status.registered) {
-		// Only offer Register when there's actually a server configured.
-		return configured
-			? {
-					label: "Permission granted",
-					hint: "This device isn't registered yet. Tap to register with your server.",
-					action: "register",
-					actionLabel: "Register",
-				}
-			: {
-					label: "Permission granted",
-					hint: "Connect to your AO server first — this device registers automatically once connected.",
-					action: null,
-					actionLabel: null,
-				};
+		return {
+			value: false,
+			disabled: false,
+			footer: "This phone isn't registered with the selected machine yet.",
+			blocked: false,
+		};
 	}
-	if (!status.granted && status.canAskAgain) {
-		// Same rule as Register above: without a server there is nothing to
-		// register with, so Enable could only burn the one-shot OS permission
-		// prompt and then fail. Pairing triggers registration on its own.
-		return configured
-			? {
-					label: "Off",
-					hint: "Turn on alerts for agents that need input and PR updates.",
-					action: "enable",
-					actionLabel: "Enable",
-				}
-			: {
-					label: "Off",
-					hint: "Connect to your AO server first — notifications turn on once connected.",
-					action: null,
-					actionLabel: null,
-				};
-	}
-	// Permanently denied — only system settings can flip it back on.
 	return {
-		label: "Blocked",
-		hint: "Notifications are turned off for AO in system settings.",
-		action: "open-settings",
-		actionLabel: "Open settings",
+		value: false,
+		disabled: false,
+		footer: "Turn on alerts for agents that need input and PR updates.",
+		blocked: false,
 	};
 }
 
@@ -151,49 +149,49 @@ export function describeRegisterFailure(
 	switch (reason) {
 		case "server-unreachable":
 			return {
-				title: "Couldn't reach your AO server",
+				title: "Couldn't reach your machine",
 				message:
-					"Your device is set up for notifications, but we couldn't reach your server to register it. " +
-					"Check that AO is running and your phone is on the same network, then try again.",
+					"Notifications are set up on this phone, but we couldn't reach your machine to register it. " +
+					"Check that Orchestrator is running and this phone is on the same network, then try again.",
 			};
 		case "server-auth":
 			return {
-				title: "Your AO server rejected the request",
+				title: "Your machine rejected the request",
 				message:
-					"We reached your server, but it wouldn't accept the connection password. " +
-					"Re-enter it under Settings → Server, then try again.",
+					"We reached your machine, but it wouldn't take the connection password. " +
+					"Re-pair under Settings → Machines, then try again.",
 			};
 		case "server-rate-limited":
 			return {
 				title: "Too many attempts",
-				message: "Your AO server is temporarily refusing new attempts. Wait a minute, then try again.",
+				message: "Your machine is refusing new attempts for now. Wait a minute, then try again.",
 			};
 		case "server-error":
 			return {
-				title: "Your AO server couldn't register this device",
+				title: "Your machine couldn't register this phone",
 				message:
-					`We reached your server, but it returned an error${status ? ` (HTTP ${status})` : ""}. ` +
-					"Check the AO logs on your computer, then try again.",
+					`We reached your machine, but it returned an error${status ? ` (HTTP ${status})` : ""}. ` +
+					"Check the Orchestrator logs on that machine, then try again.",
 			};
 		case "not-configured":
 			return {
-				title: "Connect to your AO server first",
+				title: "Pair a machine first",
 				message:
-					"This app isn't paired with a server yet, so there's nothing to register with. " +
-					"Add your server under Settings → Server (or scan its QR code) — notifications turn on once connected.",
+					"This phone isn't paired yet, so there's nothing to register. " +
+					"Pair under Settings → Machines, and notifications turn on once you're connected.",
 			};
 		case "token-failed":
 			return {
 				title: "This build can't receive push notifications",
 				message:
 					platform === "ios"
-						? "This iOS build has no push entitlement. Install a build distributed through TestFlight to receive notifications."
+						? "This build can't receive notifications. Install Orchestrator from the App Store to turn them on."
 						: "The device couldn't provide a push token for this build.",
 			};
 		case "denied":
 			return {
 				title: "Notifications are turned off",
-				message: "Allow notifications for AO in your system settings, then try again.",
+				message: "Allow notifications for Orchestrator in your system settings, then try again.",
 			};
 		case "no-project-id":
 			return {

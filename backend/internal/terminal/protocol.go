@@ -59,6 +59,9 @@ type clientMsg struct {
 	Data string `json:"data,omitempty"`
 	Cols uint16 `json:"cols,omitempty"`
 	Rows uint16 `json:"rows,omitempty"`
+	// Force explicitly re-signals an unchanged grid for attach recovery. Normal
+	// duplicate frames are ignored so they cannot trigger another TUI repaint.
+	Force bool `json:"force,omitempty"`
 	// Role is the client's role for a terminal "open" (see roleSecondary). Empty
 	// means primary.
 	Role string `json:"role,omitempty"`
@@ -77,6 +80,10 @@ type serverMsg struct {
 	Rows    uint16         `json:"rows,omitempty"`
 	Error   string         `json:"error,omitempty"`
 	Session *sessionUpdate `json:"session,omitempty"`
+
+	// raw holds a data frame's PTY output until the writer encodes it into
+	// Data, so consecutive queued output for one terminal can be merged.
+	raw []byte
 }
 
 // sessionUpdate is the ch "sessions" payload: a single CDC change projected to

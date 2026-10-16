@@ -9,12 +9,14 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 type captureAgent struct {
-	got ports.LaunchConfig
+	got        ports.LaunchConfig
+	gotRestore ports.RestoreConfig
 }
 
 func (a *captureAgent) GetConfigSpec(context.Context) (ports.ConfigSpec, error) {
@@ -28,8 +30,13 @@ func (a *captureAgent) GetPromptDeliveryStrategy(context.Context, ports.LaunchCo
 	return ports.PromptDeliveryInCommand, nil
 }
 func (a *captureAgent) GetAgentHooks(context.Context, ports.WorkspaceHookConfig) error { return nil }
-func (a *captureAgent) GetRestoreCommand(context.Context, ports.RestoreConfig) ([]string, bool, error) {
-	return nil, false, nil
+func (a *captureAgent) GetRestoreCommand(_ context.Context, cfg ports.RestoreConfig) ([]string, bool, error) {
+	a.gotRestore = cfg
+	id := cfg.Session.Metadata[ports.MetadataKeyAgentSessionID]
+	if id == "" {
+		return nil, false, nil
+	}
+	return []string{"agent", "--session", id}, true, nil
 }
 func (a *captureAgent) SessionInfo(context.Context, ports.SessionRef) (ports.SessionInfo, bool, error) {
 	return ports.SessionInfo{}, false, nil
@@ -101,6 +108,45 @@ func TestReviewCommandKeepsSystemPromptFileOutOfVisiblePrompt(t *testing.T) {
 	}
 }
 
+func TestReviewRestoreCommandUsesNativeSessionIDAndReadOnlyPolicy(t *testing.T) {
+	agent := &captureAgent{}
+	r := &Reviewer{agent: agent}
+
+	got, ok, err := r.ReviewRestoreCommand(context.Background(), ports.ReviewInvocation{
+		ReviewerID:       "review-w1",
+		AgentSessionID:   "opencode-native-1",
+		WorkspacePath:    "/ws/w1",
+		TaskPromptRoot:   filepath.Join("ao", "prompts", "reviewer"),
+		SystemPromptFile: "/ao/prompts/reviewer/system.md",
+	})
+	if err != nil {
+		t.Fatalf("ReviewRestoreCommand: %v", err)
+	}
+	if !ok {
+		t.Fatal("ReviewRestoreCommand ok = false, want true")
+	}
+	if !got.NativeResumed {
+		t.Fatal("ReviewRestoreCommand did not report native resume")
+	}
+	if strings.Join(got.Argv, " ") != "agent --session opencode-native-1" {
+		t.Fatalf("argv = %#v", got.Argv)
+	}
+	if agent.gotRestore.Session.Metadata[ports.MetadataKeyAgentSessionID] != "opencode-native-1" {
+		t.Fatalf("restore metadata = %#v", agent.gotRestore.Session.Metadata)
+	}
+	if agent.gotRestore.Permissions != ports.PermissionModeAuto {
+		t.Fatalf("restore permissions = %q, want auto", agent.gotRestore.Permissions)
+	}
+	var config map[string]any
+	if err := json.Unmarshal([]byte(got.Env["OPENCODE_CONFIG_CONTENT"]), &config); err != nil {
+		t.Fatalf("reviewer config: %v", err)
+	}
+	permission := config["permission"].(map[string]any)
+	if permission["*"] != "deny" || permission["read"] != "allow" {
+		t.Fatalf("permission policy = %#v", permission)
+	}
+}
+
 func TestBuildReviewerConfigLeavesOtherExternalPathsDenied(t *testing.T) {
 	configText, err := buildReviewerConfig("")
 	if err != nil {
@@ -124,10 +170,10 @@ func TestBuildReviewerConfigLeavesOtherExternalPathsDenied(t *testing.T) {
 func TestReviewCommandBuildsBothOpenCodeConfigSources(t *testing.T) {
 	binDir := t.TempDir()
 	binaryName := "opencode"
-	binaryBody := "#!/bin/sh\n"
+	binaryBody := "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.18.33; fi\n"
 	if runtime.GOOS == "windows" {
 		binaryName = "opencode.cmd"
-		binaryBody = "@echo off\r\n"
+		binaryBody = "@echo off\r\nif \"%1\"==\"--version\" echo 1.18.33\r\n"
 	}
 	if err := os.WriteFile(filepath.Join(binDir, binaryName), []byte(binaryBody), 0o755); err != nil {
 		t.Fatalf("write fake opencode: %v", err)
@@ -223,6 +269,22 @@ func TestReviewMessageReturnsTaskPrompt(t *testing.T) {
 	}
 	if got != "next review" {
 		t.Fatalf("message = %q", got)
+	}
+}
+
+func TestReviewCancelSendsDoubleEscapeInput(t *testing.T) {
+	spec, err := (&Reviewer{}).ReviewCancel(context.Background())
+	if err != nil {
+		t.Fatalf("ReviewCancel: %v", err)
+	}
+	if spec.Mode != ports.ReviewCancelInput {
+		t.Fatalf("cancel mode = %q, want %q", spec.Mode, ports.ReviewCancelInput)
+	}
+	if len(spec.Inputs) != 2 || spec.Inputs[0] != "\x1b" || spec.Inputs[1] != "\x1b" {
+		t.Fatalf("inputs = %#v, want double escape", spec.Inputs)
+	}
+	if spec.InputDelay != 150*time.Millisecond {
+		t.Fatalf("input delay = %s, want 150ms", spec.InputDelay)
 	}
 }
 

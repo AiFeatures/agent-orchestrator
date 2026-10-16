@@ -7,6 +7,7 @@ import type { useDaemonStatus } from "../hooks/useDaemonStatus";
 // it lives in the shell and is handed down here rather than re-run per route.
 export type ShellContextValue = {
 	daemonStatus: ReturnType<typeof useDaemonStatus>;
+	workspaceStartupState: "loading" | "ready" | "error";
 	createProject: (input: {
 		path: string;
 		workerAgent: string;
@@ -14,7 +15,21 @@ export type ShellContextValue = {
 		trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
 		asWorkspace?: boolean;
 	}) => Promise<void>;
+	cloneProject: (input: {
+		remoteUrl: string;
+		destinationParent: string;
+		workerAgent: string;
+		orchestratorAgent: string;
+		trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
+	}) => Promise<void>;
 	initializeProjectRepository: (path: string) => Promise<void>;
+	openRemoteProjectSettings: (hostId: string, projectId: string) => void;
+	/** Navigate to a project's board, e.g. a cloud project just created. */
+	openProject?: (projectId: string) => void;
+	validateImport?: (input: {
+		path: string;
+		importKind: "project" | "workspace";
+	}) => Promise<components["schemas"]["ImportValidationResult"]>;
 };
 
 const ShellContext = createContext<ShellContextValue | null>(null);

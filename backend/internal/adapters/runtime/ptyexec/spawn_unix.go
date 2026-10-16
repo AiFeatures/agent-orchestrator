@@ -35,7 +35,7 @@ func Spawn(ctx context.Context, argv, env []string, rows, cols uint16) (ports.St
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...) //nolint:forbidigo // interactive PTY child requires direct exec.Cmd ownership
 	if env != nil {
 		cmd.Env = env
 	}
@@ -119,7 +119,11 @@ func (p *creackPTY) Close() error {
 			if p.cmd.Process != nil {
 				_ = p.cmd.Process.Kill()
 			}
-			<-done
+			// SIGKILL reaps a well-behaved process and done closes; a process
+			// wedged in uninterruptible kernel state survives it, so blocking
+			// on done here would hang daemon shutdown forever. waitForExit
+			// bounds the wait and Close releases the PTY master regardless.
+			waitForExit(done, killGrace)
 		}
 		p.closeErr = p.f.Close()
 	})

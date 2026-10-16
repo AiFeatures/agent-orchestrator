@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
@@ -18,6 +20,10 @@ import (
 // worktree add, tmux launch, hook install), so it is generous compared to the
 // status probe timeout.
 const commandTimeout = 2 * time.Minute
+
+// maxDrainedBodyBytes bounds how much of an unused response body the CLI
+// discards for keep-alive reuse without an unbounded read.
+const maxDrainedBodyBytes = 4 << 10
 
 // apiError is the subset of the daemon's JSON error envelope the CLI surfaces.
 // RequestID is surfaced so a failed command can be correlated with daemon logs.
@@ -30,6 +36,40 @@ type apiError struct {
 type apiResponseError struct {
 	StatusCode int
 	ErrorBody  apiError
+}
+
+var errDaemonUnavailable = errors.New("AO daemon unavailable")
+
+// errDaemonNotRunning distinguishes a missing/stale run file from transport
+// failures so hooks can keep expected restart noise out of the agent's stderr.
+var errDaemonNotRunning = errors.New("AO daemon is not running")
+
+// daemonUnavailableError keeps the established user-facing diagnostics while
+// giving the few idempotent CLI operations that can safely retry a typed signal.
+// Most commands continue returning this error immediately through doJSON.
+type daemonUnavailableError struct {
+	message string
+	cause   error
+}
+
+func (e daemonUnavailableError) Error() string { return e.message }
+
+func (e daemonUnavailableError) Unwrap() error { return e.cause }
+
+func (e daemonUnavailableError) Is(target error) bool {
+	return target == errDaemonUnavailable || errors.Is(e.cause, target)
+}
+
+// daemonResponseBody marks read failures for retry by idempotent calls. Keeping
+// the marker at the reader boundary leaves JSON syntax and value errors intact.
+type daemonResponseBody struct{ io.ReadCloser }
+
+func (b daemonResponseBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, daemonUnavailableError{message: err.Error(), cause: err}
+	}
+	return n, err
 }
 
 func (e apiResponseError) Error() string {
@@ -95,6 +135,25 @@ func (c *commandContext) postLoopbackJSON(ctx context.Context, path string, body
 }
 
 func (c *commandContext) doJSONPath(ctx context.Context, method, path string, body, out any) error {
+	return c.doJSONPathWithHeaders(ctx, method, path, body, out, nil)
+}
+
+func (c *commandContext) doJSONPathWithHeaders(
+	ctx context.Context,
+	method, path string,
+	body, out any,
+	headers map[string]string,
+) error {
+	return c.doJSONPathWithHeadersAndTimeout(ctx, method, path, body, out, headers, commandTimeout)
+}
+
+func (c *commandContext) doJSONPathWithHeadersAndTimeout(
+	ctx context.Context,
+	method, path string,
+	body, out any,
+	headers map[string]string,
+	timeout time.Duration,
+) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -104,10 +163,10 @@ func (c *commandContext) doJSONPath(ctx context.Context, method, path string, bo
 		return err
 	}
 	if info == nil {
-		return fmt.Errorf("AO daemon is not running — start it with `ao start`")
+		return daemonUnavailableError{message: "AO daemon is not running — start it with `ao start`", cause: errDaemonNotRunning}
 	}
 	if !c.deps.ProcessAlive(info.PID) {
-		return fmt.Errorf("AO daemon is not running (stale run-file at %s) — start it with `ao start`", cfg.RunFilePath)
+		return daemonUnavailableError{message: fmt.Sprintf("AO daemon is not running (stale run-file at %s) — start it with `ao start`", cfg.RunFilePath), cause: errDaemonNotRunning}
 	}
 
 	var reader io.Reader = http.NoBody
@@ -126,15 +185,22 @@ func (c *commandContext) doJSONPath(ctx context.Context, method, path string, bo
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	if sideID := os.Getenv("AO_SIDE_CONVERSATION_ID"); sideID != "" {
+		req.Header.Set("X-AO-Side-Conversation", sideID)
+	}
 
 	// Reuse the injected client's transport (keeps it stubbable in tests) but
 	// give daemon API calls far more headroom than the 2s status-probe timeout.
 	client := *c.deps.HTTPClient
-	client.Timeout = commandTimeout
+	client.Timeout = timeout
 	resp, err := client.Do(req) // #nosec G704 -- request target is the fixed loopback daemon URL above.
 	if err != nil {
-		return fmt.Errorf("call daemon: %w", err)
+		return daemonUnavailableError{message: fmt.Sprintf("call daemon: %v", err), cause: err}
 	}
+	resp.Body = daemonResponseBody{ReadCloser: resp.Body}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -142,13 +208,51 @@ func (c *commandContext) doJSONPath(ctx context.Context, method, path string, bo
 		_ = json.NewDecoder(resp.Body).Decode(&e)
 		return apiResponseError{StatusCode: resp.StatusCode, ErrorBody: e}
 	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if out == nil {
+		// Explicitly bodyless call (telemetry/activity hooks, fire-and-forget
+		// posts). Drain only a bounded remainder so the connection can be
+		// reused without an unbounded read.
+		_, _ = io.CopyN(io.Discard, resp.Body, maxDrainedBodyBytes)
+		return nil
+	}
+	// A 204 carries no body by contract; a zero-value out is the legitimate
+	// result. Any other 2xx with a required decoded result must carry a
+	// JSON document — an empty body is a broken contract, not success.
+	if resp.StatusCode == http.StatusNoContent {
+		_, _ = io.CopyN(io.Discard, resp.Body, maxDrainedBodyBytes)
+		return nil
+	}
+	// Peek at the first non-whitespace byte before decoding: an empty body
+	// surfaces as io.EOF, but a literal JSON null decodes successfully into
+	// a zero value. Both are a broken contract for a required result, so
+	// both are rejected here rather than silently succeeding.
+	br := bufio.NewReader(resp.Body)
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return fmt.Errorf("decode response: missing required response body (HTTP %d %s %s): %w", resp.StatusCode, method, path, err)
 			}
 			return fmt.Errorf("decode response: %w", err)
 		}
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			continue
+		}
+		if b == 'n' {
+			if rest, err := br.Peek(3); err == nil && string(rest) == "ull" {
+				return fmt.Errorf("decode response: missing required response body (HTTP %d %s %s): null response body", resp.StatusCode, method, path)
+			}
+		}
+		if err := br.UnreadByte(); err != nil {
+			return fmt.Errorf("decode response: %w", err)
+		}
+		break
+	}
+	if err := json.NewDecoder(br).Decode(out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return fmt.Errorf("decode response: missing required response body (HTTP %d %s %s): %w", resp.StatusCode, method, path, err)
+		}
+		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
 }

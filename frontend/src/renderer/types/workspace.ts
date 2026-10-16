@@ -1,91 +1,22 @@
 import { attentionZone as presentationAttentionZone } from "../lib/session-presentation";
+import {
+	AGENT_OPTIONS,
+	toKanbanColumn,
+	toSessionActivity,
+	toSessionStatus,
+	type AgentId,
+	type KanbanColumn,
+	type SessionActivity,
+	type SessionActivityState,
+	type SessionStatus,
+} from "@aoagents/product-ui";
 
-export type SessionStatus =
-	| "working"
-	| "pr_open"
-	| "draft"
-	| "ci_failed"
-	| "review_pending"
-	| "changes_requested"
-	| "approved"
-	| "mergeable"
-	| "merged"
-	| "needs_input"
-	| "exited"
-	| "no_signal"
-	| "idle"
-	| "terminated"
-	| "unknown";
+import type { ReviewerHarnessId } from "../lib/reviewer-harnesses";
 
-const sessionStatuses = new Set<SessionStatus>([
-	"working",
-	"pr_open",
-	"draft",
-	"ci_failed",
-	"review_pending",
-	"changes_requested",
-	"approved",
-	"mergeable",
-	"merged",
-	"needs_input",
-	"exited",
-	"no_signal",
-	"idle",
-	"terminated",
-]);
+export { toKanbanColumn, toSessionActivity, toSessionStatus };
+export type { KanbanColumn, SessionActivity, SessionActivityState, SessionStatus };
 
-export function toSessionStatus(status?: string, isTerminated = false): SessionStatus {
-	if (status && sessionStatuses.has(status as SessionStatus)) return status as SessionStatus;
-	return isTerminated ? "terminated" : "unknown";
-}
-
-export type SessionActivityState = "active" | "idle" | "waiting_input" | "blocked" | "exited" | "unknown";
-
-const sessionActivityStates = new Set<SessionActivityState>(["active", "idle", "waiting_input", "blocked", "exited"]);
-
-export type SessionActivity = {
-	state: SessionActivityState;
-	lastActivityAt: string;
-};
-
-export function toSessionActivity(
-	activity?: { state?: string; lastActivityAt?: string } | null,
-): SessionActivity | undefined {
-	if (!activity) return undefined;
-	const state = sessionActivityStates.has(activity.state as SessionActivityState)
-		? (activity.state as SessionActivityState)
-		: "unknown";
-	return {
-		state,
-		lastActivityAt: activity.lastActivityAt ?? "",
-	};
-}
-
-export type AgentProvider =
-	| "codex"
-	| "claude-code"
-	| "opencode"
-	| "aider"
-	| "grok"
-	| "droid"
-	| "amp"
-	| "agy"
-	| "crush"
-	| "cursor"
-	| "qwen"
-	| "copilot"
-	| "goose"
-	| "auggie"
-	| "continue"
-	| "devin"
-	| "cline"
-	| "kimi"
-	| "kiro"
-	| "kilocode"
-	| "vibe"
-	| "pi"
-	| "autohand"
-	| "fake";
+export type AgentProvider = AgentId | "fake";
 
 /** A file changed in a worker workspace (drives the review rail). */
 export type ChangedFile = {
@@ -113,34 +44,166 @@ export type PullRequestFacts = {
 	ci: string;
 	review: string;
 	mergeability: string;
+	failingChecks?: Array<{
+		name: string;
+		status: "failed" | "cancelled";
+		conclusion: string;
+		url?: string;
+	}>;
 	reviewComments: boolean;
 	updatedAt: string;
 };
 
-export type WorkspaceSession = {
+/** What kind of durable output a session has produced, when known. */
+export type SessionOutputType = "none" | "pr" | "artifact" | "pr_artifact";
+
+/** One kind of file a worker can leave in its session-owned artifact directory. */
+export type ArtifactKind = "html" | "markdown" | "file";
+
+/**
+ * One file present in a session's artifact directory, mirroring the daemon's
+ * SessionArtifact wire shape. `previewUrl` is only set for `html` artifacts,
+ * which route through the existing Browser preview flow; `markdown`/`file`
+ * artifacts have no preview URL and open in the Files inspector instead.
+ * `rawUrl` is set for every kind: it is the artifact preview origin's raw
+ * byte fetch, a distinct host from the workspace preview origin, so it can
+ * never resolve to a workspace-relative file of the same path.
+ */
+export type SessionArtifact = {
+	kind: ArtifactKind;
+	name: string;
+	path: string;
+	previewUrl?: string;
+	rawUrl?: string;
+	/**
+	 * The page on its own inline origin, for framing it in the chat thread: its
+	 * files load same-origin there, and the daemon refuses that origin. html only.
+	 */
+	inlineUrl?: string;
+	size: number;
+	updatedAt: string;
+};
+
+/** The daemon-committed controller currently responsible for the session. */
+export type SessionMode = "chat" | "tui";
+
+export type AgentSwitchSummary = {
+	agentHandoffStatus: string;
+	errorCode?: string;
+	fromHarness: string;
 	id: string;
+	state: string;
+	targetHarness: string;
+	updatedAt?: string;
+};
+
+/** One stage of an asynchronous Chat start. */
+export type SessionProvisionStep = {
+	id: "fetch" | "worktree" | "setup" | "agent";
+	status: "pending" | "running" | "done";
+	startedAt?: string;
+	endedAt?: string;
+};
+
+/** The daemon's observed branch facts. `unpushed` equals `commits` until the branch reaches its remote. */
+export type SessionBranchState = { commits: number; remoteBranch?: string; unpushed: number };
+
+export type WorkspaceSession = {
+	workspaceCleanup?: "pending" | "removed" | "preserved_dirty" | "failed" | "not_applicable";
+	id: string;
+	/** Installation ID of the daemon that owns this session; absent for local and Cloud. */
+	hostId?: string;
 	terminalHandleId?: string;
+	/** Opaque controller generation; changes even when a restarted PTY reuses its handle. */
+	terminalGeneration?: string;
 	workspaceId: string;
 	workspaceName: string;
 	title: string;
 	/** Raw issue/task identifier from the daemon. Intake ids are provider-prefixed. */
 	issueId?: string;
 	provider: AgentProvider;
+	/** Reviewer selected for this session; absent means use the project default. */
+	reviewerHarness?: ReviewerHarnessId;
+	/** Per-session reviewer override, including hidden fields preserved across saves. */
+	reviewerConfig?: {
+		model?: string;
+		mode?: string;
+		permissions?: string;
+	};
+	/** Whether the daemon may automatically review this session after it becomes idle. */
+	autoReviewEnabled?: boolean;
 	kind?: SessionKind;
+	/**
+	 * Which controller is currently committed for this session. The session
+	 * surface renders from THIS value, never from the current creation default.
+	 * Only the daemon's durable interface-transition coordinator may change it.
+	 */
+	mode?: SessionMode;
 	branch?: string;
 	status: SessionStatus;
 	/** Stack-aware PR context derived by the daemon independently of runtime activity. */
 	scmStatus?: SessionStatus;
+	/**
+	 * Board lane derived by the daemon from durable delivery facts (PR
+	 * lifecycle, review runs, review ownership). `validating` and
+	 * `needs_review` are the same review-feedback loop seen from either side:
+	 * AO turning it, or a person taking the next turn. The board groups by this
+	 * and never re-derives a lane from {@link status}. For a daemon too old to
+	 * send one, {@link toKanbanColumn} keeps the placement the status already
+	 * implied rather than inventing a new one.
+	 */
+	kanbanColumn?: KanbanColumn;
+	/**
+	 * Phrase the daemon derived for what is happening inside
+	 * {@link kanbanColumn} — "Reviewing", "Fixing CI failures", "Needs human
+	 * review". It arrives renderable, so the UI prints it rather than mapping it.
+	 * Absent from a daemon too old to send one, which keeps the label
+	 * {@link status} already produced.
+	 */
+	displayStatus?: string;
+	statusReadiness?: "checking" | "ready" | "unavailable";
+	/**
+	 * How far this session's start-up got. A Chat spawn answers as soon as the
+	 * session is addressable, so a session can be open and typeable while its
+	 * worktree and agent are still being created ("provisioning"), and a start
+	 * that fails leaves the session in place ("failed") with
+	 * {@link provisionError} explaining why. Absent means ready — which is also
+	 * what every session created before asynchronous spawn reads as.
+	 */
+	provisionState?: "provisioning" | "ready" | "failed";
+	/** Why a failed start stopped, in the daemon's words. */
+	provisionError?: string;
+	/**
+	 * The checklist an asynchronous start works through, in order. A step still
+	 * "running" on a failed session is the step that failed.
+	 */
+	provisionSteps?: SessionProvisionStep[];
+	/** The daemon's observed branch facts: commits on top of the base and whether they reached the remote. */
+	branchState?: SessionBranchState;
 	/** Durable runtime fact from the daemon; independent of the derived SCM-aware status. */
 	isTerminated?: boolean;
+	/** Whether the cloud worker has a current control-plane connection. */
+	runtimeConnected?: boolean;
+	chatProviderPreserved?: boolean;
 	/** User preference to tear down this session when its PR set completes through a merge. */
 	terminateOnPrMerge?: boolean;
+	/** Whether SCM review feedback is automatically injected into the worker. */
+	autoInjectReview?: boolean;
+	/** Whether CI failures are automatically injected into the worker. */
+	autoInjectCI?: boolean;
 	/** ISO timestamp from the daemon — used for relative time in the inspector. */
 	createdAt?: string;
 	/** ISO timestamp from the daemon. */
 	updatedAt: string;
+	/** ISO timestamp of the latest real user-authored message, when known. */
+	lastUserMessageAt?: string;
+	/** ISO timestamp of human direction or deliberate same-project orchestrator direction. */
+	lastInteractionAt?: string;
+	isPinned?: boolean;
+	pinnedAt?: string;
 	/** Raw agent lifecycle activity from the daemon. */
 	activity?: SessionActivity;
+	activeAgentSwitch?: AgentSwitchSummary;
 	/**
 	 * Live preview target set by the daemon (via `ao preview`) and streamed over
 	 * CDC. When non-empty, the browser panel opens and navigates here.
@@ -162,6 +225,35 @@ export type WorkspaceSession = {
 	 * done server-side, so {@link status} already reflects all of these.
 	 */
 	prs: PullRequestFacts[];
+	/** What kind of durable output this session has produced, when known. */
+	outputType?: SessionOutputType;
+	/** The deliverable requested at spawn; "artifact" for sessions started from Create artifact. */
+	requestedOutput?: "artifact";
+	/**
+	 * Files present in this session's artifact directory, when {@link outputType}
+	 * is `"artifact"`. Empty/absent for sessions whose output is a PR or nothing.
+	 */
+	artifactFiles?: SessionArtifact[];
+	/**
+	 * Present only for sessions that run in a control-plane sandbox. Carries the
+	 * org the session is scoped to so its terminal can be opened against the CP;
+	 * absent for local sessions, which route through the local daemon.
+	 */
+	cloud?: {
+		orgId: string;
+		/** Maximum permission mode for Cloud turns in this session. */
+		permissionMode?: "read-only" | "standard" | "trusted";
+		sandboxProvider?: string;
+		desiredState?: string;
+		observedState?: string;
+		/** Sandbox runtime state; "terminated" means AO stopped retrying startup. */
+		runtimeState?: string;
+		runtimeError?: string;
+		/** Why the worker has not started; cleared once it connects. */
+		startupError?: { code: string; message: string; at: string; detail?: string };
+		/** Bring-your-own Coder workspace page; absent for managed compute. */
+		coderWorkspaceUrl?: string;
+	};
 };
 
 // Tracker providers whose ids the intake daemon stamps sessions with, in
@@ -181,6 +273,13 @@ export function canonicalTrackerIssueId(issueId?: string): string | undefined {
 }
 
 export type ProjectKind = "single_repo" | "workspace" | "scratch";
+
+/** UI-only grouping for sessions that have no daemon project row. */
+export const STANDALONE_WORKSPACE_ID = "__standalone__" as const;
+export const STANDALONE_PROJECT_KIND = "standalone" as const;
+
+/** Sentinel `kind` value for projects hosted by the AO cloud control plane. */
+export const CLOUD_PROJECT_KIND = "cloud" as const;
 
 const projectKinds = new Set<ProjectKind>(["single_repo", "workspace", "scratch"]);
 
@@ -216,7 +315,13 @@ export function primaryPR(session: WorkspaceSession): PullRequestFacts | undefin
 	return sortedPRs(session)[0];
 }
 
-export function isOrchestratorSession(session: WorkspaceSession): boolean {
+/** Artifact files to show in the Summary panel, for sessions whose output includes artifacts. */
+export function sessionArtifacts(session: WorkspaceSession): SessionArtifact[] {
+	if (session.outputType !== "artifact" && session.outputType !== "pr_artifact") return [];
+	return session.artifactFiles ?? [];
+}
+
+export function isOrchestratorSession(session: Pick<WorkspaceSession, "id" | "kind">): boolean {
 	return session.kind === "orchestrator" || session.id.endsWith("-orchestrator");
 }
 
@@ -254,18 +359,64 @@ function sessionNewer(a: WorkspaceSession, b: WorkspaceSession): boolean {
 	return a.id > b.id;
 }
 
+function sessionRecentlyMessagedNewer(a: WorkspaceSession, b: WorkspaceSession): boolean {
+	const aMessaged = sessionLastMessageTimestamp(a);
+	const bMessaged = sessionLastMessageTimestamp(b);
+	if (aMessaged !== bMessaged) return aMessaged > bMessaged;
+	const aUpdated = timestamp(a.updatedAt);
+	const bUpdated = timestamp(b.updatedAt);
+	if (aUpdated !== bUpdated) return aUpdated > bUpdated;
+	return a.id > b.id;
+}
+
+/** The sidebar's direction-age label and sort share the same timestamp. */
+function sessionLastMessageTimestamp(session: WorkspaceSession): number {
+	return (
+		validTimestamp(session.lastInteractionAt) ??
+		validTimestamp(session.lastUserMessageAt) ??
+		validTimestamp(session.createdAt) ??
+		0
+	);
+}
+
 function timestamp(value?: string): number {
-	if (!value) return 0;
+	return validTimestamp(value) ?? 0;
+}
+
+function validTimestamp(value?: string): number | undefined {
+	if (!value) return undefined;
 	const parsed = Date.parse(value);
-	return Number.isNaN(parsed) ? 0 : parsed;
+	return Number.isNaN(parsed) ? undefined : parsed;
 }
 
 export function workerSessions(sessions: WorkspaceSession[]): WorkspaceSession[] {
 	return sessions.filter((s) => !isOrchestratorSession(s));
 }
 
+/** Worker sessions ordered by the user's latest message (else creation), newest first. */
+export function sortedWorkerSessions(sessions: WorkspaceSession[]): WorkspaceSession[] {
+	return workerSessions(sessions).sort((a, b) =>
+		sessionRecentlyMessagedNewer(b, a) ? 1 : sessionRecentlyMessagedNewer(a, b) ? -1 : 0,
+	);
+}
+
 export function sessionIsActive(session: WorkspaceSession): boolean {
 	return session.isTerminated !== true && session.status !== "terminated";
+}
+
+/**
+ * Whether the agent PROCESS is gone while the session ROW is still alive —
+ * Ctrl+C, `/exit`, a usage limit. Recovered with `resume-agent`, not `restore`.
+ * Not `sessionIsActive`, which reports row liveness and calls this state alive.
+ */
+export function sessionAgentExited(session: WorkspaceSession | undefined): boolean {
+	return Boolean(session && session.activity?.state === "exited" && sessionIsActive(session));
+}
+
+/** Whether a session can accept a Cue from its topbar. The daemon makes the
+ * final decision, including whether a command Cue's worktree still exists. */
+export function sessionCueTargetAvailable(session: WorkspaceSession | undefined): boolean {
+	return Boolean(session && sessionIsActive(session) && session.activity?.state !== "exited" && session.activity?.state !== "blocked");
 }
 
 export function sessionNeedsAttention(session: WorkspaceSession): boolean {
@@ -277,9 +428,20 @@ export type { AttentionZone } from "../lib/session-presentation";
 
 export type WorkspaceSummary = {
 	id: string;
+	cloudOrgId?: string;
+	/** Installation ID of the daemon that owns this project; absent for local and Cloud. */
+	hostId?: string;
 	name: string;
-	kind?: ProjectKind;
+	/**
+	 * Discriminator for where the project lives. Local projects carry the
+	 * daemon's ProjectKind (or undefined for older daemons); projects hosted by
+	 * the AO cloud control plane carry CLOUD_PROJECT_KIND — branch on
+	 * `kind === CLOUD_PROJECT_KIND`.
+	 */
+	kind?: ProjectKind | typeof CLOUD_PROJECT_KIND | typeof STANDALONE_PROJECT_KIND;
+	/** Local checkout path; empty string for cloud projects (no local folder). */
 	path: string;
+	folderMissing?: boolean;
 	workspaceRepos?: WorkspaceRepoSummary[];
 	type?: "main" | "worktree";
 	orchestratorAgent?: AgentProvider;
@@ -290,6 +452,12 @@ export type WorkspaceSummary = {
 	};
 	sessions: WorkspaceSession[];
 };
+
+export function hasConfiguredOrchestratorAgent(
+	workspace: Pick<WorkspaceSummary, "orchestratorAgent"> | undefined,
+): boolean {
+	return Boolean(workspace?.orchestratorAgent);
+}
 
 export function orchestratorNeedsRestart(workspace: WorkspaceSummary, orchestrator?: WorkspaceSession): boolean {
 	if (!orchestrator || !workspace.orchestratorAgent) return false;
@@ -332,32 +500,44 @@ export function orchestratorHealth(workspace: WorkspaceSummary, restarting = fal
 }
 
 export function toAgentProvider(provider?: string): AgentProvider {
-	switch (provider) {
-		case "claude-code":
-		case "opencode":
-		case "aider":
-		case "grok":
-		case "droid":
-		case "amp":
-		case "agy":
-		case "crush":
-		case "cursor":
-		case "qwen":
-		case "copilot":
-		case "goose":
-		case "auggie":
-		case "continue":
-		case "devin":
-		case "cline":
-		case "kimi":
-		case "kiro":
-		case "kilocode":
-		case "vibe":
-		case "pi":
-		case "autohand":
-		case "fake":
-			return provider;
-		default:
-			return "codex";
+	if (provider === "fake") return provider;
+	return AGENT_OPTIONS.find((candidate) => candidate === provider) ?? "codex";
+}
+
+export type NextSessionNavigation =
+	| { target: "session"; sessionId: string }
+	| { target: "project" };
+
+/**
+ * Resolves where to navigate after an active session is killed.
+ * Prioritizes:
+ * 1. Adjacent remaining worker session (previous if available, else first remaining).
+ * 2. Active non-terminated orchestrator if no worker sessions remain.
+ * 3. Project board if no alive sessions remain.
+ */
+export function resolveNextNavigationAfterSessionKill(
+	workspace: WorkspaceSummary | undefined,
+	killedSessionId: string,
+	sessionsInDisplayOrder?: WorkspaceSession[],
+): NextSessionNavigation {
+	if (!workspace) return { target: "project" };
+
+	const workerList = (sessionsInDisplayOrder ?? sortedWorkerSessions(workspace.sessions)).filter(
+		(s) => s.isTerminated !== true,
+	);
+	const currentIndex = workerList.findIndex((s) => s.id === killedSessionId);
+	const remaining = workerList.filter((s) => s.id !== killedSessionId);
+
+	if (remaining.length > 0) {
+		const nextIndex = currentIndex > 0 ? currentIndex - 1 : 0;
+		const nextSession = remaining[nextIndex] ?? remaining[0];
+		return { target: "session", sessionId: nextSession.id };
 	}
+
+	const orchestrator = newestActiveOrchestrator(workspace.sessions);
+	if (orchestrator && orchestrator.id !== killedSessionId && orchestrator.isTerminated !== true) {
+		return { target: "session", sessionId: orchestrator.id };
+	}
+
+	return { target: "project" };
 }
