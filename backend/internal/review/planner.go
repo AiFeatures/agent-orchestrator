@@ -4,22 +4,23 @@ import (
 	"sort"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/pkg/contract"
 )
 
 // StateStatus is the per-PR review planning state.
-type StateStatus string
+type StateStatus = contract.AOReviewState
 
 const (
 	// ReviewStateNeedsReview means an eligible PR has no current AO approval or running pass.
-	ReviewStateNeedsReview StateStatus = "needs_review"
+	ReviewStateNeedsReview = contract.AOReviewNeedsReview
 	// ReviewStateRunning means a review run is already active for the PR's current head.
-	ReviewStateRunning StateStatus = "running"
+	ReviewStateRunning = contract.AOReviewRunning
 	// ReviewStateUpToDate means AO approved the PR's current head.
-	ReviewStateUpToDate StateStatus = "up_to_date"
+	ReviewStateUpToDate = contract.AOReviewUpToDate
 	// ReviewStateChangesRequested means AO requested changes on the PR's current head.
-	ReviewStateChangesRequested StateStatus = "changes_requested"
-	// ReviewStateIneligible means the PR is draft, closed, merged, or missing required facts.
-	ReviewStateIneligible StateStatus = "ineligible"
+	ReviewStateChangesRequested = contract.AOReviewChangesRequested
+	// ReviewStateIneligible means the PR is closed, merged, or missing required facts.
+	ReviewStateIneligible = contract.AOReviewIneligible
 )
 
 // PRReviewState is one PR-scoped review decision for a worker session.
@@ -50,7 +51,7 @@ func Plan(prs []domain.PullRequest, runs []domain.ReviewRun) []PRReviewState {
 		if run, ok := latestCompletedRunForOtherSHA(runs, review.PRURL, review.TargetSHA); ok {
 			review.PreviousRun = &run
 		}
-		if pr.URL == "" || pr.HeadSHA == "" || pr.Draft || pr.Merged || pr.Closed {
+		if pr.URL == "" || pr.HeadSHA == "" || pr.Merged || pr.Closed {
 			review.Status = ReviewStateIneligible
 			if run, ok := latest[review.PRURL+"\x00"+review.TargetSHA]; ok {
 				review.LatestRun = &run
@@ -108,6 +109,10 @@ func latestCompletedRunForOtherSHA(runs []domain.ReviewRun, prURL, targetSHA str
 	return latest, found
 }
 
+// latestRunsByPRAndSHA picks the authoritative run per PR head: the newest
+// running pass while any reviewer is still working on that head, otherwise the
+// newest pass. Several reviewers may review one head at once, so a reviewer that
+// finished first must not hide one that is still running.
 func latestRunsByPRAndSHA(runs []domain.ReviewRun) map[string]domain.ReviewRun {
 	latest := make(map[string]domain.ReviewRun)
 	for _, run := range runs {
@@ -115,7 +120,20 @@ func latestRunsByPRAndSHA(runs []domain.ReviewRun) map[string]domain.ReviewRun {
 			continue
 		}
 		key := run.PRURL + "\x00" + run.TargetSHA
-		if existing, ok := latest[key]; !ok || run.CreatedAt.After(existing.CreatedAt) {
+		existing, ok := latest[key]
+		if !ok {
+			latest[key] = run
+			continue
+		}
+		runRunning := run.Status == domain.ReviewRunRunning
+		existingRunning := existing.Status == domain.ReviewRunRunning
+		if runRunning != existingRunning {
+			if runRunning {
+				latest[key] = run
+			}
+			continue
+		}
+		if run.CreatedAt.After(existing.CreatedAt) {
 			latest[key] = run
 		}
 	}

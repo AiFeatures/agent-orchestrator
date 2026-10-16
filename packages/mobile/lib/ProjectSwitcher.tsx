@@ -1,48 +1,88 @@
-import { ScrollView, StyleSheet, View } from "react-native";
+import { Feather } from "./icons";
+import { useRouter } from "expo-router";
+import { Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import type { Theme } from "./theme";
+import { haptics } from "./haptics";
+import { activeProjectLabel } from "./projectFilter";
+import { projectSheetRoute } from "./sheetResult";
 import { useApp } from "./store";
-import { Pill } from "./ui";
+import { useTheme, useThemedStyles } from "./ThemeProvider";
+import { iconSize, space, type } from "./tokens";
 
-// Horizontal pill row to scope the view to one project (or All). Only renders
-// when there's more than one project - single-project users never see clutter.
+// Scopes the board to one project (or All). A header row — label, current
+// scope, overflow button — rather than the horizontal pill row it replaced: the
+// pills grew a scrollable list that pushed the board down and hid every project
+// past the third one off the right edge.
 //
-// The row lives in a fixed-height wrapper that the ScrollView fills via flex.
-// On the New Architecture (Expo SDK 54) a bare `height` on a horizontal
-// ScrollView isn't laid out deterministically - its measured height drifts
-// between re-renders (e.g. switching the active chip), nudging everything below
-// it. A bounded parent + flex pins the row to one height in every state.
+// It opens the same sheet Settings uses, so there is one project picker in the
+// app instead of two controls that drift apart.
 export function ProjectSwitcher() {
-	const { projects, activeProjectId, setActiveProject } = useApp();
+	const t = useTheme();
+	const styles = useThemedStyles(makeStyles);
+	const { projects, projectsKnown, activeProjectId, setActiveProject } = useApp();
+	const router = useRouter();
+
+	// Nothing to switch between — a single-project user never sees this.
 	if (projects.length <= 1) return null;
 
-	const items = [{ id: "all", name: "All" }, ...projects];
+	const active = projects.find((p) => p.id === activeProjectId);
 
 	return (
-		<View style={styles.container}>
-			<ScrollView
-				horizontal
-				showsHorizontalScrollIndicator={false}
-				style={styles.scroll}
-				contentContainerStyle={styles.row}
-			>
-				{items.map((p) => (
-					<Pill
-						key={p.id}
-						label={p.name}
-						active={activeProjectId === p.id}
-						onPress={() => setActiveProject(p.id)}
-						style={styles.pill}
-					/>
-				))}
-			</ScrollView>
-		</View>
+		<>
+			<View style={styles.row}>
+				<Text style={styles.label}>PROJECTS</Text>
+				<Pressable
+					onPress={() => {
+						haptics.tap();
+						// No navigation on select — the board is already on screen, so the
+						// filter applying in place is the whole feedback.
+						router.push(projectSheetRoute({ selected: activeProjectId, onSelect: setActiveProject }));
+					}}
+					hitSlop={10}
+					style={({ pressed }) => [styles.trigger, pressed && styles.triggerPressed]}
+					accessibilityRole="button"
+					accessibilityLabel="Change active project"
+				>
+					<Text style={[styles.value, active && { color: t.accent }]} numberOfLines={1}>
+						{activeProjectLabel(activeProjectId, projects, projectsKnown)}
+					</Text>
+					{/* A chevron, not an overflow "…": this changes a value rather than
+					    revealing a menu of actions. */}
+					<Feather name="chevron-down" size={iconSize.sm} color={active ? t.accent : t.textTertiary} />
+				</Pressable>
+			</View>
+
+		</>
 	);
 }
 
-const ROW_HEIGHT = 40;
-
-const styles = StyleSheet.create({
-	container: { height: ROW_HEIGHT, marginBottom: 12 },
-	scroll: { flex: 1 },
-	row: { paddingHorizontal: 16, gap: 8, alignItems: "center" },
-	pill: { flexShrink: 0 },
+const makeStyles = (t: Theme) =>
+	StyleSheet.create({
+	row: {
+		flexDirection: "row",
+		alignItems: "center",
+		gap: space.md,
+		paddingHorizontal: space.lg,
+		paddingBottom: space.xxs,
+	},
+	label: { fontFamily: "Geist_600SemiBold",
+		color: t.textSecondary,
+		fontSize: type.footnote.fontSize,
+		letterSpacing: 0.8,
+		fontWeight: "600",
+		flex: 1,
+	},
+	trigger: {
+		flexDirection: "row",
+		alignItems: "center",
+		gap: space.xs,
+		// Keep the right-hand picker in one place as project names change.
+		...(Platform.OS === "ios" ? { width: "60%" as const, justifyContent: "flex-end" as const } : { maxWidth: "70%" as const }),
+		paddingVertical: space.xxs,
+		paddingHorizontal: space.sm,
+		marginRight: -8,
+		borderRadius: 8, borderCurve: "continuous",
+	},
+	triggerPressed: { backgroundColor: t.bgElevated },
+	value: { fontFamily: "Geist_600SemiBold", color: t.textTertiary, fontSize: type.footnote.fontSize, fontWeight: "600", flexShrink: 1, ...(Platform.OS === "ios" ? { textAlign: "right" as const } : {}) },
 });

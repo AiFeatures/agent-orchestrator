@@ -29,6 +29,8 @@ func (s *Store) UpsertSessionWorktree(ctx context.Context, row domain.SessionWor
 		RepoName:     row.RepoName,
 		Branch:       row.Branch,
 		BaseSha:      row.BaseSHA,
+		BaseRef:      row.BaseRef,
+		CreationSha:  row.CreationSHA,
 		WorktreePath: row.WorktreePath,
 		PreservedRef: row.PreservedRef,
 		State:        state,
@@ -73,6 +75,8 @@ func sessionWorktreeFromGen(row gen.SessionWorktree) domain.SessionWorktreeRecor
 		RepoName:     row.RepoName,
 		Branch:       row.Branch,
 		BaseSHA:      row.BaseSha,
+		BaseRef:      row.BaseRef,
+		CreationSHA:  row.CreationSha,
 		WorktreePath: row.WorktreePath,
 		PreservedRef: row.PreservedRef,
 		// ponytail: state is read back from the DB but no caller uses it;

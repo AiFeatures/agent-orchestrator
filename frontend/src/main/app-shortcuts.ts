@@ -1,18 +1,22 @@
 import {
-	FOCUS_TERMINAL_SHORTCUT_CHANNEL,
+	APP_SHORTCUT_CHANNEL,
+	APP_SHORTCUTS,
+	CLOSE_SHELL_TERMINAL_SHORTCUT_CHANNEL,
 	KEYBOARD_SHORTCUTS_HELP_CHANNEL,
-	matchesFocusTerminalShortcut,
-	matchesKeyboardShortcutsHelpShortcut,
-	matchesNextSessionShortcut,
-	matchesNewSessionShortcut,
-	matchesNewShellTerminalShortcut,
-	matchesOpenSettingsShortcut,
-	matchesPreviousSessionShortcut,
+	matchesAppShortcut,
+	shortcutYieldsToTerminal,
 	NEXT_SESSION_SHORTCUT_CHANNEL,
+	NEXT_TAB_SHORTCUT_CHANNEL,
 	NEW_SESSION_SHORTCUT_CHANNEL,
 	NEW_SHELL_TERMINAL_SHORTCUT_CHANNEL,
 	OPEN_SETTINGS_SHORTCUT_CHANNEL,
 	PREVIOUS_SESSION_SHORTCUT_CHANNEL,
+	PREVIOUS_TAB_SHORTCUT_CHANNEL,
+	terminalFontSizeDelta,
+	TERMINAL_FONT_SIZE_SHORTCUT_CHANNEL,
+	type AppShortcutEvent,
+	type AppShortcutId,
+	type KeybindingOverrides,
 	type ShortcutChord,
 } from "../shared/shortcuts";
 
@@ -41,17 +45,38 @@ type BeforeInputContents = {
 
 type ShortcutTargetContents = {
 	focus: () => void;
-	send: (channel: string) => void;
+	send: (channel: string, ...args: unknown[]) => void;
 };
 
-const appShortcutChannel = (chord: ShortcutChord, isMac: boolean): string | null => {
-	if (matchesNewSessionShortcut(chord, isMac)) return NEW_SESSION_SHORTCUT_CHANNEL;
-	if (matchesNewShellTerminalShortcut(chord, isMac)) return NEW_SHELL_TERMINAL_SHORTCUT_CHANNEL;
-	if (matchesKeyboardShortcutsHelpShortcut(chord, isMac)) return KEYBOARD_SHORTCUTS_HELP_CHANNEL;
-	if (matchesOpenSettingsShortcut(chord, isMac)) return OPEN_SETTINGS_SHORTCUT_CHANNEL;
-	if (matchesPreviousSessionShortcut(chord, isMac)) return PREVIOUS_SESSION_SHORTCUT_CHANNEL;
-	if (matchesNextSessionShortcut(chord, isMac)) return NEXT_SESSION_SHORTCUT_CHANNEL;
-	if (matchesFocusTerminalShortcut(chord, isMac)) return FOCUS_TERMINAL_SHORTCUT_CHANNEL;
+// Shortcuts that predate the generic channel keep their dedicated one; every
+// other command is delivered as `{ id, index? }` on APP_SHORTCUT_CHANNEL.
+const legacyShortcutChannels: Partial<Record<AppShortcutId, string>> = {
+	"new-session": NEW_SESSION_SHORTCUT_CHANNEL,
+	"new-shell-terminal": NEW_SHELL_TERMINAL_SHORTCUT_CHANNEL,
+	"close-shell-terminal": CLOSE_SHELL_TERMINAL_SHORTCUT_CHANNEL,
+	"keyboard-shortcuts": KEYBOARD_SHORTCUTS_HELP_CHANNEL,
+	"open-settings": OPEN_SETTINGS_SHORTCUT_CHANNEL,
+	"previous-session": PREVIOUS_SESSION_SHORTCUT_CHANNEL,
+	"next-session": NEXT_SESSION_SHORTCUT_CHANNEL,
+	"previous-tab": PREVIOUS_TAB_SHORTCUT_CHANNEL,
+	"next-tab": NEXT_TAB_SHORTCUT_CHANNEL,
+};
+
+// Handled in main itself rather than forwarded to the shell.
+const mainHandledShortcuts: ReadonlySet<AppShortcutId> = new Set(["toggle-browser-devtools"]);
+
+const appShortcutMatch = (
+	chord: ShortcutChord,
+	isMac: boolean,
+	overrides: KeybindingOverrides,
+): { id: AppShortcutId; channel: string; payload: unknown[] } | null => {
+	for (const { id } of APP_SHORTCUTS) {
+		if (mainHandledShortcuts.has(id) || !matchesAppShortcut(id, chord, isMac, overrides)) continue;
+		const legacy = legacyShortcutChannels[id];
+		if (legacy) return { id, channel: legacy, payload: [] };
+		const event: AppShortcutEvent = id === "jump-to-session" ? { id, index: Number(chord.key) - 1 } : { id };
+		return { id, channel: APP_SHORTCUT_CHANNEL, payload: [event] };
+	}
 	return null;
 };
 
@@ -63,24 +88,66 @@ export function attachAppShortcuts(
 	isMac: boolean,
 	target: ShortcutTargetContents,
 	focusTarget = false,
+	getOverrides: () => KeybindingOverrides = () => ({}),
+	isRecording: () => boolean = () => false,
+	shouldHandle: (id: AppShortcutId, chord: ShortcutChord) => boolean = () => true,
+	onShortcut?: (id: AppShortcutId) => void,
+	isTerminalFocused: () => boolean = () => false,
+	// Only terminals that resize their own font claim the zoom chords; the rest
+	// leave them to app zoom. Defaults to "any focused terminal" for callers that
+	// do not distinguish.
+	isTerminalFontSizeFocused: () => boolean = isTerminalFocused,
 ): void {
 	contents.on("before-input-event", (event, input) => {
-		if (input.type !== "keyDown" || input.isAutoRepeat) return;
-		const channel = appShortcutChannel(
-			{
-				key: input.key,
-				code: input.code,
-				ctrl: input.control,
-				meta: input.meta,
-				shift: input.shift,
-				alt: input.alt,
-			},
-			isMac,
-		);
-		if (!channel) return;
+		if (input.type !== "keyDown") return;
+		const chord = {
+			key: input.key,
+			code: input.code,
+			ctrl: input.control,
+			meta: input.meta,
+			shift: input.shift,
+			alt: input.alt,
+		};
+		const fontSizeDelta = terminalFontSizeDelta(chord, isMac);
+		if (fontSizeDelta !== 0 && isTerminalFontSizeFocused()) {
+			event.preventDefault();
+			if (focusTarget) target.focus();
+			target.send(TERMINAL_FONT_SIZE_SHORTCUT_CHANNEL, fontSizeDelta);
+			return;
+		}
+		// Let the renderer's capture listener receive application-owned chords
+		// while the user is recording a replacement binding.
+		if (isRecording()) return;
+		if (
+			onShortcut &&
+			!input.isAutoRepeat &&
+			matchesAppShortcut("toggle-browser-devtools", chord, isMac, getOverrides()) &&
+			shouldHandle("toggle-browser-devtools", chord)
+		) {
+			event.preventDefault();
+			if (focusTarget) target.focus();
+			onShortcut("toggle-browser-devtools");
+			return;
+		}
+		const match = appShortcutMatch(chord, isMac, getOverrides());
+		if (!match) return;
+		const { id, channel, payload } = match;
+		if (!isMac && shortcutYieldsToTerminal(id, chord) && isTerminalFocused()) return;
+		if (!shouldHandle(id, chord)) {
+			// Browser context owns these chords. Consume them so a racing shell
+			// listener cannot open/close a terminal from the same keypress, and so
+			// Chromium does not treat ⌘T as an unhandled accelerator.
+			if (id === "new-shell-terminal" || id === "close-shell-terminal") {
+				event.preventDefault();
+			}
+			return;
+		}
 
 		event.preventDefault();
+		// Consume repeats without re-firing: a held ⌘W must stay a single close,
+		// never a fall-through to the menu's Close item.
+		if (input.isAutoRepeat) return;
 		if (focusTarget) target.focus();
-		target.send(channel);
+		target.send(channel, ...payload);
 	});
 }

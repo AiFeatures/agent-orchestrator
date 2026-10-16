@@ -5,6 +5,7 @@
 package ports
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -74,6 +75,13 @@ type SCMObservation struct {
 	// Mergeability contains AO's mergeability verdict and blockers.
 	Mergeability SCMMergeabilityObservation
 
+	// Error classifies a Fetched=false result, including a permanent not-found
+	// miss or a transient per-observation failure from a composite provider. It
+	// is NOT durable state: callers inspect it before persistence, then discard
+	// it so the storage layer never sees provider-error classification. A
+	// non-nil Error always implies Fetched=false.
+	Error error
+
 	// Changed marks which semantic buckets changed compared with the DB snapshot.
 	Changed SCMChanged
 }
@@ -88,10 +96,32 @@ type SCMChanged struct {
 	Review bool
 }
 
+// SCMIdentity describes the account authenticated with the SCM provider.
+type SCMIdentity struct {
+	// Login is the provider login/name of the authenticated account.
+	Login string
+	// Human is true when the provider identifies the account as a human user.
+	Human bool
+}
+
+// ScopedIdentityResolver resolves the authenticated identity for a specific
+// provider key and host. Multi-provider implementations use this to delegate
+// to the matching sub-provider's identity method, passing host through so
+// that self-managed GitLab hosts resolve identity against the correct client.
+// GitHub sub-providers ignore host (their identity is not host-scoped).
+type ScopedIdentityResolver interface {
+	AuthenticatedIdentityForProvider(ctx context.Context, provider, host string) (SCMIdentity, error)
+}
+
 // SCMPRObservation carries provider-neutral PR metadata.
 type SCMPRObservation struct {
+	// ProviderID is the provider-owned immutable identifier for this PR/MR.
+	// Consumers scope it by the observation's provider and host.
+	ProviderID string
 	// URL is the canonical PR URL used as the persistence key.
 	URL string
+	// URLAlias is the previously requested URL when it resolved to URL.
+	URLAlias string
 	// Number is the provider's PR number in the repository.
 	Number int
 	// State is AO's normalized PR state: draft, open, merged, or closed.
@@ -108,6 +138,8 @@ type SCMPRObservation struct {
 	// branch lives in. It matches the base repo for same-repo PRs and differs
 	// for PRs opened from a fork, so branch-prefix attribution can ignore forks.
 	HeadRepo string
+	// BaseRepo is the provider's current full name of the base repository.
+	BaseRepo string
 	// TargetBranch is the PR base/target branch name.
 	TargetBranch string
 	// HeadSHA is the current head commit SHA for the PR.
@@ -122,6 +154,9 @@ type SCMPRObservation struct {
 	ChangedFiles int
 	// Author is the provider login/name of the PR author.
 	Author string
+	// AuthorAvatarURL is the provider-hosted profile image URL for the PR author.
+	// It is optional because not every provider or historical record supplies one.
+	AuthorAvatarURL string
 	// BaseSHA is the current base branch SHA when the provider supplies it.
 	BaseSHA string
 	// MergeCommitSHA is the merge commit SHA when the PR has one.
@@ -160,6 +195,12 @@ type SCMCIObservation struct {
 	FailedChecks []SCMCheckObservation
 	// FailureLogTail is the combined tail of newly fetched failed-check logs.
 	FailureLogTail string
+	// Partial is true when the CI check listing was truncated by the
+	// provider's pagination cap (e.g. more than 1,000 pipeline jobs). When
+	// true, Checks/FailedChecks are a bounded snapshot, not an authoritative
+	// complete CI state — the observer must not overwrite durable checks as
+	// Fetched=true complete (review Item 13). Mirrors SCMReviewObservation.Partial.
+	Partial bool
 }
 
 // SCMCheckObservation is one normalized check/status context. ProviderID is an
@@ -207,6 +248,9 @@ type SCMReviewSummaryObservation struct {
 	// Body is the reviewer's submitted summary text, empty when the provider
 	// review carried no body.
 	Body string
+	// TargetSHA is the PR head commit SHA this provider review was submitted
+	// against, when the provider exposes it.
+	TargetSHA string
 	// IsBot is true when the provider identifies the reviewer as a bot.
 	IsBot bool
 	// SubmittedAt is the provider's review submission timestamp.
@@ -233,6 +277,8 @@ type SCMReviewThreadObservation struct {
 type SCMReviewCommentObservation struct {
 	// ID is the provider's stable review comment identifier.
 	ID string
+	// ReviewID is the provider's stable identifier for the parent review.
+	ReviewID string
 	// Author is the provider login/name of the commenter.
 	Author string
 	// Body is the review comment text.

@@ -22,6 +22,10 @@ import (
 
 const adapterID = "autohand"
 
+// NoBrowserEnv is Autohand's opt-out for opening an external browser when a
+// command discovers that authentication is required.
+const NoBrowserEnv = "AUTOHAND_NO_BROWSER"
+
 // Plugin is the Autohand agent adapter. It is safe for concurrent use; the
 // binary path is resolved once and cached under binaryMu.
 type Plugin struct {
@@ -39,6 +43,14 @@ func New() *Plugin {
 var _ adapters.Adapter = (*Plugin)(nil)
 var _ ports.Agent = (*Plugin)(nil)
 
+// AugmentRuntimeEnv keeps ordinary AO-managed sessions from opening an
+// external browser when Autohand discovers that account authentication is
+// required. The explicit agent-auth action still runs outside this session
+// environment and retains Autohand's native browser login flow.
+func (p *Plugin) AugmentRuntimeEnv(env map[string]string, _ string) {
+	env[NoBrowserEnv] = "1"
+}
+
 // Manifest returns the adapter's static self-description.
 func (p *Plugin) Manifest() adapters.Manifest {
 	return adapters.Manifest{
@@ -54,18 +66,7 @@ func (p *Plugin) Manifest() adapters.Manifest {
 
 // GetConfigSpec reports the per-project agent config keys Autohand understands.
 func (p *Plugin) GetConfigSpec(ctx context.Context) (ports.ConfigSpec, error) {
-	if err := ctx.Err(); err != nil {
-		return ports.ConfigSpec{}, err
-	}
-	return ports.ConfigSpec{
-		Fields: []ports.ConfigField{
-			{
-				Key:         "model",
-				Type:        ports.ConfigFieldString,
-				Description: "Model override passed to `autohand --model`.",
-			},
-		},
-	}, nil
+	return agentbase.ModelConfigSpec(ctx, "Model override passed to `autohand --model`.")
 }
 
 // GetLaunchCommand builds the argv to start a new Autohand command-mode session,
@@ -84,7 +85,7 @@ func (p *Plugin) GetLaunchCommand(ctx context.Context, cfg ports.LaunchConfig) (
 	cmd = []string{binary}
 	appendWorkspaceFlag(&cmd, cfg.WorkspacePath)
 	appendApprovalFlags(&cmd, cfg.Permissions)
-	appendModelFlag(&cmd, cfg.Config)
+	agentbase.AppendModelFlag(&cmd, cfg.Config, "--model")
 
 	// Autohand's --sys-prompt accepts either an inline string or a file path,
 	// auto-detected by the CLI; prefer inline instructions when AO has them.
@@ -124,7 +125,7 @@ func (p *Plugin) GetRestoreCommand(ctx context.Context, cfg ports.RestoreConfig)
 	cmd = make([]string, 0, 7)
 	cmd = append(cmd, binary, "resume")
 	appendWorkspaceFlag(&cmd, cfg.Session.WorkspacePath)
-	appendModelFlag(&cmd, cfg.Config)
+	agentbase.AppendModelFlag(&cmd, cfg.Config, "--model")
 	cmd = append(cmd, agentSessionID)
 	return cmd, true, nil
 }
@@ -143,14 +144,6 @@ func (p *Plugin) SessionInfo(ctx context.Context, session ports.SessionRef) (por
 func appendWorkspaceFlag(cmd *[]string, workspacePath string) {
 	if strings.TrimSpace(workspacePath) != "" {
 		*cmd = append(*cmd, "--path", workspacePath)
-	}
-}
-
-// appendModelFlag appends a trimmed --model flag when a model override is
-// configured. Accepted on both the launch and resume argv.
-func appendModelFlag(cmd *[]string, cfg ports.AgentConfig) {
-	if model := strings.TrimSpace(cfg.Model); model != "" {
-		*cmd = append(*cmd, "--model", model)
 	}
 }
 

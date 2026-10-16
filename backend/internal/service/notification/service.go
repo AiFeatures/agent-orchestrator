@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
@@ -20,17 +24,57 @@ const (
 
 // Manager reads stored notifications for REST controllers.
 type Manager struct {
-	store Store
+	store         Store
+	publisher     Publisher
+	barrier       sync.Locker
+	logger        *slog.Logger
+	newClearID    func() string
+	clearEpoch    string
+	clearSequence int64
+}
+
+// Publisher sends notification changes to live dashboard subscribers.
+type Publisher interface {
+	Publish(ctx context.Context, event domain.NotificationEvent) error
+}
+
+// ClearResult describes one completed notification-history clear.
+type ClearResult struct {
+	ClearedCount  int64
+	ClearID       string
+	ClearEpoch    string
+	ClearSequence int64
 }
 
 // Deps configures a Manager.
 type Deps struct {
-	Store Store
+	Store      Store
+	Publisher  Publisher
+	Barrier    sync.Locker
+	Logger     *slog.Logger
+	NewClearID func() string
+	ClearEpoch string
 }
 
-// New constructs a read-only notification Manager.
+// New constructs a notification Manager.
 func New(d Deps) *Manager {
-	return &Manager{store: d.Store}
+	m := &Manager{
+		store: d.Store, publisher: d.Publisher, barrier: d.Barrier,
+		logger: d.Logger, newClearID: d.NewClearID, clearEpoch: d.ClearEpoch,
+	}
+	if m.barrier == nil {
+		m.barrier = &sync.Mutex{}
+	}
+	if m.logger == nil {
+		m.logger = slog.New(slog.DiscardHandler)
+	}
+	if m.newClearID == nil {
+		m.newClearID = func() string { return "ntf_clear_" + uuid.NewString() }
+	}
+	if m.clearEpoch == "" {
+		m.clearEpoch = "ntf_clear_epoch_" + uuid.NewString()
+	}
+	return m
 }
 
 // List returns one stable newest-first page of notification history.
@@ -42,7 +86,11 @@ func (m *Manager) List(ctx context.Context, filter ListFilter) (ListPage, error)
 		filter.Status = ListUnread
 	}
 	if !filter.Status.Valid() {
-		return ListPage{}, apierr.Invalid("INVALID_NOTIFICATION_STATUS", "Notification status must be unread or all", nil)
+		return ListPage{}, apierr.Invalid(
+			"INVALID_NOTIFICATION_STATUS",
+			"Notification status must be unread, unresolved, or all",
+			nil,
+		)
 	}
 	limit := normalizeLimit(filter.Limit)
 	beforeCreatedAt, beforeID, err := decodeCursor(filter.Cursor)
@@ -57,6 +105,10 @@ func (m *Manager) List(ctx context.Context, filter ListFilter) (ListPage, error)
 	if err != nil {
 		return ListPage{}, err
 	}
+	unresolvedCount, err := m.store.CountUnresolvedNotifications(ctx)
+	if err != nil {
+		return ListPage{}, err
+	}
 	hasMore := len(rows) > limit
 	if hasMore {
 		rows = rows[:limit]
@@ -65,7 +117,7 @@ func (m *Manager) List(ctx context.Context, filter ListFilter) (ListPage, error)
 	for _, row := range rows {
 		out = append(out, notificationFromRecord(row))
 	}
-	page := ListPage{Notifications: out, UnreadCount: int(unreadCount)}
+	page := ListPage{Notifications: out, UnreadCount: int(unreadCount), UnresolvedCount: int(unresolvedCount)}
 	if hasMore {
 		page.NextCursor = encodeCursor(rows[len(rows)-1])
 	}
@@ -90,12 +142,78 @@ func (m *Manager) MarkRead(ctx context.Context, id string) (Notification, bool, 
 	return notificationFromRecord(row), true, nil
 }
 
-// MarkAllRead marks all unread notifications read and returns the affected row count.
-func (m *Manager) MarkAllRead(ctx context.Context) (int64, error) {
+// MarkAllRead acknowledges notifications as seen. With ids it acknowledges
+// exactly those rows — the ones a client actually rendered — which keeps
+// anything past the client's last loaded page unread and therefore still
+// reachable. With no ids it falls back to acknowledging every unread row, for
+// clients that do not paginate.
+func (m *Manager) MarkAllRead(ctx context.Context, ids []string) (int64, error) {
 	if m == nil || m.store == nil {
 		return 0, errors.New("notification: store is required")
 	}
-	return m.store.MarkAllNotificationsRead(ctx)
+	if len(ids) == 0 {
+		return m.store.MarkAllNotificationsRead(ctx)
+	}
+	return m.store.MarkNotificationsRead(ctx, ids)
+}
+
+// Delete removes one notification without changing its session or PR state.
+func (m *Manager) Delete(ctx context.Context, id string) (Notification, error) {
+	if m == nil || m.store == nil {
+		return Notification{}, errors.New("notification: store is required")
+	}
+	if id == "" {
+		return Notification{}, apierr.Invalid("INVALID_NOTIFICATION_ID", "Notification id is required", nil)
+	}
+	m.barrier.Lock()
+	defer m.barrier.Unlock()
+	row, ok, err := m.store.DeleteNotification(ctx, id)
+	if err != nil {
+		return Notification{}, err
+	}
+	if !ok {
+		return Notification{}, apierr.NotFound("NOTIFICATION_NOT_FOUND", "Unknown notification")
+	}
+	if m.publisher != nil {
+		if err := m.publisher.Publish(ctx, domain.NotificationEvent{Kind: domain.NotificationDeleted, Record: row}); err != nil {
+			m.logger.WarnContext(ctx, "notification delete event publish failed", "error", err)
+		}
+	}
+	return notificationFromRecord(row), nil
+}
+
+// ClearAll deletes notification history and publishes the same ordered clear
+// generation that the HTTP response returns. Clients use the epoch and sequence
+// to reject a stale response when concurrent clears complete out of order.
+func (m *Manager) ClearAll(ctx context.Context) (ClearResult, error) {
+	if m == nil || m.store == nil {
+		return ClearResult{}, errors.New("notification: store is required")
+	}
+	m.barrier.Lock()
+	defer m.barrier.Unlock()
+	cleared, err := m.store.ClearAllNotifications(ctx)
+	if err != nil {
+		return ClearResult{}, err
+	}
+	m.clearSequence++
+	result := ClearResult{
+		ClearedCount:  cleared,
+		ClearID:       m.newClearID(),
+		ClearEpoch:    m.clearEpoch,
+		ClearSequence: m.clearSequence,
+	}
+	if m.publisher != nil {
+		event := domain.NotificationEvent{
+			Kind:          domain.NotificationCleared,
+			ClearID:       result.ClearID,
+			ClearEpoch:    result.ClearEpoch,
+			ClearSequence: result.ClearSequence,
+		}
+		if err := m.publisher.Publish(ctx, event); err != nil {
+			m.logger.WarnContext(ctx, "notification clear event publish failed", "error", err)
+		}
+	}
+	return result, nil
 }
 
 func normalizeLimit(limit int) int {

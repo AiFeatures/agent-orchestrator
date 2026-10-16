@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { AGENT_OPTIONS } from "@aoagents/product-ui";
 import {
 	attentionZone,
 	canonicalTrackerIssueId,
 	findProjectOrchestrator,
 	newestActiveOrchestrator,
 	orchestratorHealth,
+	sessionAgentExited,
+	sessionCueTargetAvailable,
 	sessionIsActive,
 	sessionNeedsAttention,
 	toAgentProvider,
@@ -13,10 +16,12 @@ import {
 	openPRs,
 	mergedPRCount,
 	primaryPR,
+	sessionArtifacts,
 	sortedPRs,
 	type AttentionZone,
 	type PRState,
 	type PullRequestFacts,
+	type SessionArtifact,
 	type SessionStatus,
 	type WorkspaceSession,
 	type WorkspaceSummary,
@@ -108,6 +113,39 @@ describe("sessionIsActive", () => {
 		expect(sessionIsActive(sessionWith({ status: "working" }))).toBe(true);
 		expect(sessionIsActive(sessionWith({ status: "pr_open" }))).toBe(true);
 		expect(sessionIsActive(sessionWith({ status: "exited" }))).toBe(true);
+	});
+});
+
+describe("sessionAgentExited", () => {
+	it.each([undefined, false])(
+		"rejects a terminated status when isTerminated is %s",
+		(isTerminated) => {
+			expect(
+				sessionAgentExited(
+					sessionWith({
+						status: "terminated",
+						isTerminated,
+						activity: { state: "exited", lastActivityAt: "2026-09-21T00:00:00Z" },
+					}),
+				),
+			).toBe(false);
+		},
+	);
+});
+
+describe("sessionCueTargetAvailable", () => {
+	it("accepts an active session even when activity has not been observed", () => {
+		expect(sessionCueTargetAvailable(sessionWith({}))).toBe(true);
+	});
+
+	it.each(["exited", "blocked"] as const)("rejects %s activity", (state) => {
+		expect(sessionCueTargetAvailable(sessionWith({ activity: { state, lastActivityAt: "2026-09-25T00:00:00Z" } }))).toBe(false);
+	});
+
+	it("rejects both terminated facts", () => {
+		expect(sessionCueTargetAvailable(sessionWith({ isTerminated: true }))).toBe(false);
+		expect(sessionCueTargetAvailable(sessionWith({ status: "terminated" }))).toBe(false);
+		expect(sessionCueTargetAvailable(undefined)).toBe(false);
 	});
 });
 
@@ -257,8 +295,11 @@ describe("orchestratorHealth", () => {
 });
 
 describe("toAgentProvider", () => {
-	it("passes through a known provider", () => {
-		expect(toAgentProvider("opencode")).toBe("opencode");
+	it.each(AGENT_OPTIONS)("passes through the shared provider %s", (provider) => {
+		expect(toAgentProvider(provider)).toBe(provider);
+	});
+	it("passes through Prime Agent", () => {
+		expect(toAgentProvider("prime-agent")).toBe("prime-agent");
 	});
 
 	it("defaults unknown and undefined providers to codex", () => {
@@ -303,6 +344,44 @@ describe("PR helpers", () => {
 
 	it("primaryPR is undefined when there are no PRs", () => {
 		expect(primaryPR(sessionWith({ prs: [] }))).toBeUndefined();
+	});
+});
+
+describe("sessionArtifacts", () => {
+	const artifact = (overrides: Partial<SessionArtifact> & { path: string }): SessionArtifact => ({
+		kind: "file",
+		name: overrides.path,
+		size: 0,
+		updatedAt: "2026-01-01T00:00:00Z",
+		...overrides,
+	});
+
+	it("returns the artifact files when outputType is artifact", () => {
+		const session = sessionWith({
+			outputType: "artifact",
+			artifactFiles: [artifact({ path: "report.md", kind: "markdown" })],
+		});
+		expect(sessionArtifacts(session)).toEqual([artifact({ path: "report.md", kind: "markdown" })]);
+	});
+
+	it("is empty when outputType is pr, even if artifactFiles is populated", () => {
+		const session = sessionWith({
+			outputType: "pr",
+			artifactFiles: [artifact({ path: "report.md" })],
+		});
+		expect(sessionArtifacts(session)).toEqual([]);
+	});
+
+	it("returns the artifact files when outputType is pr_artifact (a session with both)", () => {
+		const session = sessionWith({
+			outputType: "pr_artifact",
+			artifactFiles: [artifact({ path: "report.md", kind: "markdown" })],
+		});
+		expect(sessionArtifacts(session)).toEqual([artifact({ path: "report.md", kind: "markdown" })]);
+	});
+
+	it("is empty when outputType is artifact but artifactFiles is absent", () => {
+		expect(sessionArtifacts(sessionWith({ outputType: "artifact" }))).toEqual([]);
 	});
 });
 

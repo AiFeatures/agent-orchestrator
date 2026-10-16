@@ -1,40 +1,96 @@
-import { useRouter } from "expo-router";
-import { useMemo, useState } from "react";
-import { Linking, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { ActivityIndicator, RefreshControl, SectionList, StyleSheet, View } from "react-native";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import type { DashboardPR, DashboardSession } from "../../lib/api";
+import type { Theme } from "../../lib/theme";
 import { haptics } from "../../lib/haptics";
+import { PRCard } from "../../lib/PRCard";
+import { PRFilterDock } from "../../lib/pr-filter-dock";
 import { ProjectSwitcher } from "../../lib/ProjectSwitcher";
-import { useApp, usePRs } from "../../lib/store";
-import { ciVisual, theme } from "../../lib/theme";
+import { collectPRs, prLifecycle, prListSections, type PRListFilter } from "../../lib/prView";
+import { StaleBanner } from "../../lib/StaleBanner";
+import { useApp } from "../../lib/store";
+import { UnpairedState } from "../../lib/UnpairedState";
+import { PR_SUMMARY_REUSE_MS, usePRSummaries } from "../../lib/usePRSummaries";
+import { useBoardFailure } from "../../lib/useBoardFailure";
 import { useTabScrollToTop } from "../../lib/useTabScrollToTop";
-import { Button, Chip, ConnectionPill, EmptyState, Pill, ScreenHeader } from "../../lib/ui";
+import { Button, EmptyState, HeaderIconButton, ListSectionHeader, ScreenHeader } from "../../lib/ui";
+import { useTheme, useThemedStyles } from "../../lib/ThemeProvider";
+import { space } from "../../lib/tokens";
+import type { HostedSession } from "../../lib/hostedRows";
 
-type Filter = "open" | "merged" | "all";
+export { RouteErrorBoundary as ErrorBoundary } from "../../lib/RouteErrorBoundary";
+
+type Filter = PRListFilter;
+
+// Drafts are open PRs — they belong in the Open bucket even though the card
+// labels them "draft". Before, `state` had already folded draft into "open", so
+// the distinction did not exist anywhere.
+const inBucket = (filter: Filter, life: ReturnType<typeof prLifecycle>) => {
+	if (filter === "all") return true;
+	if (filter === "open") return life === "open" || life === "draft";
+	return life === "merged";
+};
 
 export default function PRsScreen() {
+	const t = useTheme();
+	const styles = useThemedStyles(makeStyles);
 	const insets = useSafeAreaInsets();
 	const router = useRouter();
-	const { configured, connection, refresh } = useApp();
-	const prs = usePRs();
+	const { hostId: routeHostId, projectId: routeProjectId } = useLocalSearchParams<{ hostId?: string; projectId?: string }>();
+	const { hostStates, allSessions, configForHost, refreshAll, activeProjectId } = useApp();
+	const visibleHosts = useMemo(() => routeHostId ? hostStates.filter((host) => host.hostId === routeHostId) : hostStates, [hostStates, routeHostId]);
+	const projectFilter = routeHostId ? (routeProjectId ?? "all") : hostStates.length === 1 ? activeProjectId : "all";
+	const prs = useMemo(() => {
+		// Hosted rows are structurally shared across sync/notification updates.
+		// Keep those identities, and deduplicate PRs within each machine only.
+		const byHost = new Map<string, HostedSession[]>();
+		for (const session of allSessions) {
+			if (routeHostId && session.hostId !== routeHostId) continue;
+			const rows = byHost.get(session.hostId);
+			if (rows) rows.push(session);
+			else byHost.set(session.hostId, [session]);
+		}
+		return [...byHost.values()].flatMap(sessions => collectPRs(sessions).filter(({ session }) => projectFilter === "all" || session.projectId === projectFilter));
+	}, [allSessions, routeHostId, projectFilter]);
+	const configured = hostStates.length > 0;
+	const loading = visibleHosts.some((host) => host.loading);
+	const error = visibleHosts.every((host) => host.connection !== "open") ? visibleHosts.find((host) => host.error)?.error : null;
+	const notificationsUnread = hostStates.reduce((sum, host) => sum + host.notificationsUnread, 0);
 	const [filter, setFilter] = useState<Filter>("open");
 	const [refreshing, setRefreshing] = useState(false);
 
-	const scrollRef = useTabScrollToTop<ScrollView>();
+	const scrollRef = useTabScrollToTop<SectionList>();
 
-	const filtered = useMemo(() => {
-		return prs.filter(({ pr }) => {
-			const st = pr.state ?? "open";
-			if (filter === "all") return true;
-			if (filter === "open") return st === "open";
-			return st === "merged";
-		});
-	}, [prs, filter]);
+	// Grouped around the user's next action, matching the Workers board rather
+	// than presenting a flat stream in daemon order.
+	const filtered = useMemo(() => prs.filter(({ pr }) => inBucket(filter, prLifecycle(pr))), [prs, filter]);
+	const sections = useMemo(() => prListSections(prs, filter), [prs, filter]);
+
+	// The rich per-PR detail the cards show lives on a separate endpoint, fetched
+	// once per session and cached — see usePRSummaries. Pull-to-refresh is the
+	// only thing that re-fetches it.
+	const summaryTargets = useMemo(() => filtered.flatMap(({ session }) => {
+		const config = configForHost(session.hostId);
+		return config ? [{ config, sessionId: session.id }] : [];
+	}), [filtered, configForHost]);
+	const summaries = usePRSummaries(summaryTargets);
+	const lastSummaryRefresh = useRef(Date.now());
+	useFocusEffect(useCallback(() => {
+		// Retained tabs should not keep old detail indefinitely, nor restart N
+		// requests on every quick sidebar switch.
+		if (Date.now() - lastSummaryRefresh.current < PR_SUMMARY_REUSE_MS) return;
+		lastSummaryRefresh.current = Date.now();
+		summaries.reload();
+	}, [summaries.reload]));
+	const failure = useBoardFailure();
 
 	const onRefresh = async () => {
 		haptics.tap();
 		setRefreshing(true);
-		await refresh();
+		lastSummaryRefresh.current = Date.now();
+		summaries.reload();
+		await refreshAll();
 		setRefreshing(false);
 	};
 
@@ -42,160 +98,101 @@ export default function PRsScreen() {
 		return (
 			<View style={styles.screen}>
 				<View style={{ height: insets.top }} />
-				<EmptyState icon="git-pull-request" title="No server" message="Connect to AO in Settings." />
+				{/* Workers and Projects both keep their header in the unpaired state; this
+				    screen dropped it, so the tab lost its title and connection lamp exactly
+				    when a user most needs to know what they are looking at. */}
+				<ScreenHeader title="Pull Requests" />
+				<UnpairedState />
 			</View>
 		);
 	}
 
 	const counts = {
-		open: prs.filter((p) => (p.pr.state ?? "open") === "open").length,
-		merged: prs.filter((p) => p.pr.state === "merged").length,
+		open: prs.filter((p) => inBucket("open", prLifecycle(p.pr))).length,
+		merged: prs.filter((p) => prLifecycle(p.pr) === "merged").length,
 		all: prs.length,
 	};
 
 	return (
 		<View style={styles.screen}>
 			<View style={{ height: insets.top }} />
-			<ScreenHeader title="Pull Requests" right={<ConnectionPill status={connection} />} />
-			<ProjectSwitcher />
-
-			<View style={styles.filters}>
-				{(["open", "merged", "all"] as Filter[]).map((f) => (
-					<Pill
-						key={f}
-						label={`${f[0].toUpperCase() + f.slice(1)} ${counts[f]}`}
-						active={filter === f}
-						onPress={() => setFilter(f)}
+			<ScreenHeader
+				title="Pull Requests"
+				right={
+					<HeaderIconButton
+						icon="bell"
+						label="Notifications"
+						badge={notificationsUnread}
+						onPress={() => router.navigate("/notifications")}
 					/>
-				))}
-			</View>
+				}
+			/>
+			{hostStates.length === 1 && !routeHostId ? <ProjectSwitcher /> : null}
+			{hostStates.length === 1 ? <StaleBanner error={!!error} onRetry={onRefresh} /> : null}
 
-			<ScrollView
-				ref={scrollRef}
-				contentContainerStyle={{ paddingBottom: 110, paddingTop: 4 }}
-				refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={theme.blue} />}
-			>
-				{filtered.length === 0 ? (
-					<EmptyState
-						icon="git-pull-request"
-						title="No pull requests"
-						message={filter === "open" ? "No open PRs right now." : "Nothing here yet."}
-					/>
-				) : (
-					filtered.map(({ pr, session }) => (
-						<PRCard
-							key={`${pr.owner}/${pr.repo}#${pr.number}`}
+			{loading && prs.length === 0 ? (
+				<View style={styles.center}>
+					<ActivityIndicator color={t.accent} />
+				</View>
+			) : (
+				<SectionList
+					ref={scrollRef}
+					sections={sections}
+					keyExtractor={({ pr, session }) => `${session.hostId}:${session.projectId}#${pr.number}`}
+					contentContainerStyle={{ paddingBottom: 110 }}
+					stickySectionHeadersEnabled={false}
+					refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={t.accent} />}
+					renderSectionHeader={({ section }) => <ListSectionHeader label={section.label} />}
+					renderItem={({ item: { pr, session } }) => {
+						const config = configForHost(session.hostId);
+						return <PRCard
 							pr={pr}
 							session={session}
-							onOpenSession={() =>
-								router.push({
-									pathname: "/session/[id]",
-									params: { id: session.id, projectId: session.projectId },
-								})
-							}
-						/>
-					))
-				)}
-			</ScrollView>
-		</View>
-	);
-}
+							hostId={session.hostId}
+							hostName={hostStates.length > 1 ? session.hostName : undefined}
+							summary={config ? summaries.summaryFor(config, session.id, pr.number) : undefined}
+						/>;
+					}}
+					ListEmptyComponent={
+						filtered.length === 0 ? (
+							error ? (
+								<EmptyState
+									icon={failure.icon}
+									title={failure.title}
+									message={failure.hint}
+									action={<Button title="Retry" icon="refresh-cw" variant="ghost" onPress={onRefresh} />}
+								/>
+							) : (
+								<EmptyState
+									icon="git-pull-request"
+									title="No pull requests"
+									message={filter === "open" ? "No open PRs right now." : "Nothing here yet."}
+								/>
+							)
+						) : null
+					}
+				/>
+			)}
 
-function PRCard({
-	pr,
-	session,
-	onOpenSession,
-}: {
-	pr: DashboardPR;
-	session: DashboardSession;
-	onOpenSession: () => void;
-}) {
-	const ci = pr.ciStatus;
-	const review = pr.reviewDecision;
-
-	return (
-		<View style={styles.card}>
-			<View style={styles.cardTop}>
-				<Text style={styles.repo} numberOfLines={1}>
-					{pr.repo ? `${pr.owner}/${pr.repo}` : session.projectId}
-				</Text>
-				<View style={{ flex: 1 }} />
-				{pr.state === "merged" ? (
-					<Chip label="merged" color={theme.green} tint={theme.tintGreen} icon="git-merge" />
-				) : pr.state === "closed" ? (
-					<Chip label="closed" color={theme.red} tint={theme.tintRed} />
-				) : (
-					<Text style={styles.num}>#{pr.number}</Text>
-				)}
-			</View>
-
-			<Text style={styles.title} numberOfLines={2}>
-				{pr.title ?? `Pull request #${pr.number}`}
-			</Text>
-
-			<View style={styles.chips}>
-				{ci && ci !== "none"
-					? (() => {
-							const c = ciVisual(ci);
-							return <Chip label={c.label} color={c.color} tint={c.tint} icon={c.icon} />;
-						})()
-					: null}
-				{review === "approved" ? (
-					<Chip label="approved" color={theme.green} tint={theme.tintGreen} icon="check" />
-				) : review === "changes_requested" ? (
-					<Chip label="changes req." color={theme.amber} tint={theme.tintAmber} icon="edit-3" />
-				) : null}
-				{pr.additions !== undefined && pr.deletions !== undefined ? (
-					<View style={styles.diffChip}>
-						<Text style={[styles.diffText, { color: theme.green }]}>+{pr.additions}</Text>
-						<Text style={[styles.diffText, { color: theme.red }]}>-{pr.deletions}</Text>
-					</View>
-				) : null}
-				{pr.unresolvedThreads ? (
-					<Chip
-						label={`${pr.unresolvedThreads} threads`}
-						color={theme.amber}
-						tint={theme.tintAmber}
-						icon="message-square"
-					/>
-				) : null}
-			</View>
-
-			<View style={styles.actions}>
-				<Button title="Session" variant="ghost" icon="terminal" onPress={onOpenSession} style={styles.flexBtn} />
-				{pr.url ? (
-					<Button
-						title="Open"
-						variant="ghost"
-						icon="external-link"
-						onPress={() => Linking.openURL(pr.url!)}
-						style={styles.flexBtn}
-					/>
-				) : null}
+			<View style={[styles.dock, { bottom: Math.max(insets.bottom, 12) }]}>
+				<PRFilterDock filter={filter} counts={counts} onChange={setFilter} />
 			</View>
 		</View>
 	);
 }
 
-const styles = StyleSheet.create({
-	screen: { flex: 1, backgroundColor: theme.bgBase },
-	filters: { flexDirection: "row", gap: 8, paddingHorizontal: 16, paddingBottom: 12 },
-	card: {
-		backgroundColor: theme.bgElevated,
-		borderRadius: 12,
-		borderWidth: 1,
-		borderColor: theme.borderSubtle,
-		padding: 14,
-		marginHorizontal: 12,
-		marginVertical: 5,
-	},
-	cardTop: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
-	repo: { color: theme.textTertiary, fontSize: 12, fontFamily: theme.fontMono },
-	num: { color: theme.textSecondary, fontSize: 13, fontWeight: "700", fontFamily: theme.fontMono },
-	title: { color: theme.textPrimary, fontSize: 15, fontWeight: "500", lineHeight: 20 },
-	chips: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginTop: 12 },
-	diffChip: { flexDirection: "row", gap: 6, alignItems: "center", paddingHorizontal: 4 },
-	diffText: { fontSize: 11, fontWeight: "700", fontFamily: theme.fontMono },
-	actions: { flexDirection: "row", gap: 8, marginTop: 14 },
-	flexBtn: { flex: 1, paddingVertical: 10 },
-});
+const makeStyles = (t: Theme) =>
+	StyleSheet.create({
+		screen: { flex: 1, backgroundColor: t.bgBase },
+		center: { flex: 1, alignItems: "center", justifyContent: "center" },
+		dock: {
+			position: "absolute",
+			left: 16,
+			right: 16,
+			height: 52,
+			flexDirection: "row",
+			alignItems: "center",
+			justifyContent: "center",
+			gap: space.sm,
+		},
+	});

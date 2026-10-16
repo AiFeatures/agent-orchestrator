@@ -17,19 +17,34 @@ const (
 	NotificationPRMerged NotificationType = "pr_merged"
 	// NotificationPRClosedUnmerged means a tracked PR closed without merging.
 	NotificationPRClosedUnmerged NotificationType = "pr_closed_unmerged"
+	// NotificationReviewCompleted means an AO reviewer approved a pull request.
+	NotificationReviewCompleted NotificationType = "review_completed"
+	// NotificationReviewChangesRequested means an AO reviewer found changes to make.
+	NotificationReviewChangesRequested NotificationType = "review_changes_requested"
 )
 
 // Valid reports whether t is one of the v1 notification kinds.
 func (t NotificationType) Valid() bool {
 	switch t {
-	case NotificationNeedsInput, NotificationReadyToMerge, NotificationPRMerged, NotificationPRClosedUnmerged:
+	case NotificationNeedsInput, NotificationReadyToMerge, NotificationPRMerged, NotificationPRClosedUnmerged,
+		NotificationReviewCompleted, NotificationReviewChangesRequested:
 		return true
 	default:
 		return false
 	}
 }
 
-// NotificationStatus is the read state for a stored notification.
+// NeedsResolution reports whether t describes an issue that stays open until
+// something changes (an agent waiting on the user, a PR waiting on a merge).
+// Terminal facts — a PR that merged or closed — describe something that already
+// happened, so they are surfaced once as unseen and never held as unresolved.
+func (t NotificationType) NeedsResolution() bool {
+	return t == NotificationNeedsInput || t == NotificationReadyToMerge
+}
+
+// NotificationStatus is the seen state for a stored notification. The stored
+// values remain "unread"/"read" for wire and schema compatibility; "unread"
+// means the user has not opened the notification panel since it arrived.
 type NotificationStatus string
 
 const (
@@ -57,11 +72,19 @@ const (
 	NotificationListUnread NotificationListStatus = "unread"
 	// NotificationListAll returns both read and unread notifications.
 	NotificationListAll NotificationListStatus = "all"
+	// NotificationListUnresolved returns notifications whose underlying issue is
+	// still open, regardless of whether the user has already seen them.
+	NotificationListUnresolved NotificationListStatus = "unresolved"
 )
 
 // Valid reports whether s is a supported notification list filter.
 func (s NotificationListStatus) Valid() bool {
-	return s == NotificationListUnread || s == NotificationListAll
+	switch s {
+	case NotificationListUnread, NotificationListAll, NotificationListUnresolved:
+		return true
+	default:
+		return false
+	}
 }
 
 // NotificationRecord is the durable notification persistence shape.
@@ -75,6 +98,40 @@ type NotificationRecord struct {
 	Body      string
 	Status    NotificationStatus
 	CreatedAt time.Time
+	// ResolvedAt is when the underlying issue went away — the session received
+	// its input, or the PR stopped waiting on a merge. Zero means still open.
+	// Only AO writes it; there is no user-facing "resolve" action.
+	ResolvedAt time.Time
+	// SourceKey identifies the durable transition that produced a terminal
+	// notification. It is internal dedupe metadata and is not exposed over HTTP.
+	SourceKey string
+}
+
+// Resolved reports whether the issue behind this notification is closed.
+func (r NotificationRecord) Resolved() bool { return !r.ResolvedAt.IsZero() }
+
+// NotificationEventKind distinguishes the live notification stream events.
+type NotificationEventKind string
+
+const (
+	// NotificationCreated announces a newly persisted notification.
+	NotificationCreated NotificationEventKind = "created"
+	// NotificationResolved announces that a stored notification's underlying
+	// issue went away, so open dashboards can drop it from the unresolved list.
+	NotificationResolved NotificationEventKind = "resolved"
+	// NotificationDeleted announces that one stored notification was deleted.
+	NotificationDeleted NotificationEventKind = "deleted"
+	// NotificationCleared announces that notification history was deleted.
+	NotificationCleared NotificationEventKind = "cleared"
+)
+
+// NotificationEvent is one live notification-stream message.
+type NotificationEvent struct {
+	Kind          NotificationEventKind
+	Record        NotificationRecord
+	ClearID       string
+	ClearEpoch    string
+	ClearSequence int64
 }
 
 var (
@@ -88,7 +145,7 @@ var (
 
 // Validate checks the required fields and enum values for a stored notification.
 func (r NotificationRecord) Validate() error {
-	if r.SessionID == "" || r.ProjectID == "" || r.Title == "" || r.CreatedAt.IsZero() {
+	if r.SessionID == "" || r.Title == "" || r.CreatedAt.IsZero() {
 		return ErrInvalidNotificationRecord
 	}
 	if !r.Type.Valid() {

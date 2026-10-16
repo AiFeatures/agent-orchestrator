@@ -17,6 +17,10 @@ type Store interface {
 		limit int,
 	) ([]domain.NotificationRecord, error)
 	CountUnreadNotifications(ctx context.Context) (int64, error)
+	CountUnresolvedNotifications(ctx context.Context) (int64, error)
 	MarkNotificationRead(ctx context.Context, id string) (domain.NotificationRecord, bool, error)
 	MarkAllNotificationsRead(ctx context.Context) (int64, error)
+	MarkNotificationsRead(ctx context.Context, ids []string) (int64, error)
+	DeleteNotification(ctx context.Context, id string) (domain.NotificationRecord, bool, error)
+	ClearAllNotifications(ctx context.Context) (int64, error)
 }

@@ -31,7 +31,7 @@ func (q *Queries) DeleteWorkspaceReposByProject(ctx context.Context, projectID d
 }
 
 const getSessionWorktree = `-- name: GetSessionWorktree :one
-SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state
+SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state, base_ref, creation_sha
 FROM session_worktrees
 WHERE session_id = ? AND repo_name = ?
 `
@@ -52,12 +52,14 @@ func (q *Queries) GetSessionWorktree(ctx context.Context, arg GetSessionWorktree
 		&i.WorktreePath,
 		&i.PreservedRef,
 		&i.State,
+		&i.BaseRef,
+		&i.CreationSha,
 	)
 	return i, err
 }
 
 const listSessionWorktrees = `-- name: ListSessionWorktrees :many
-SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state
+SELECT session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state, base_ref, creation_sha
 FROM session_worktrees
 WHERE session_id = ?
 ORDER BY CASE WHEN repo_name = '__root__' THEN 0 ELSE 1 END, repo_name
@@ -80,6 +82,8 @@ func (q *Queries) ListSessionWorktrees(ctx context.Context, sessionID domain.Ses
 			&i.WorktreePath,
 			&i.PreservedRef,
 			&i.State,
+			&i.BaseRef,
+			&i.CreationSha,
 		); err != nil {
 			return nil, err
 		}
@@ -95,27 +99,39 @@ func (q *Queries) ListSessionWorktrees(ctx context.Context, sessionID domain.Ses
 }
 
 const listWorkspaceRepos = `-- name: ListWorkspaceRepos :many
-SELECT project_id, name, relative_path, repo_origin_url, registered_at
+SELECT project_id, name, relative_path, repo_origin_url, default_branch, registered_at, git_status
 FROM workspace_repos
 WHERE project_id = ?
 ORDER BY name
 `
 
-func (q *Queries) ListWorkspaceRepos(ctx context.Context, projectID domain.ProjectID) ([]WorkspaceRepo, error) {
+type ListWorkspaceReposRow struct {
+	ProjectID     domain.ProjectID
+	Name          string
+	RelativePath  string
+	RepoOriginURL string
+	DefaultBranch string
+	RegisteredAt  time.Time
+	GitStatus     string
+}
+
+func (q *Queries) ListWorkspaceRepos(ctx context.Context, projectID domain.ProjectID) ([]ListWorkspaceReposRow, error) {
 	rows, err := q.db.QueryContext(ctx, listWorkspaceRepos, projectID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []WorkspaceRepo{}
+	items := []ListWorkspaceReposRow{}
 	for rows.Next() {
-		var i WorkspaceRepo
+		var i ListWorkspaceReposRow
 		if err := rows.Scan(
 			&i.ProjectID,
 			&i.Name,
 			&i.RelativePath,
 			&i.RepoOriginURL,
+			&i.DefaultBranch,
 			&i.RegisteredAt,
+			&i.GitStatus,
 		); err != nil {
 			return nil, err
 		}
@@ -131,11 +147,13 @@ func (q *Queries) ListWorkspaceRepos(ctx context.Context, projectID domain.Proje
 }
 
 const upsertSessionWorktree = `-- name: UpsertSessionWorktree :exec
-INSERT INTO session_worktrees (session_id, repo_name, branch, base_sha, worktree_path, preserved_ref, state)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO session_worktrees (session_id, repo_name, branch, base_sha, base_ref, creation_sha, worktree_path, preserved_ref, state)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (session_id, repo_name) DO UPDATE SET
     branch = excluded.branch,
     base_sha = excluded.base_sha,
+    base_ref = excluded.base_ref,
+    creation_sha = excluded.creation_sha,
     worktree_path = excluded.worktree_path,
     preserved_ref = excluded.preserved_ref,
     state = excluded.state
@@ -146,6 +164,8 @@ type UpsertSessionWorktreeParams struct {
 	RepoName     string
 	Branch       string
 	BaseSha      string
+	BaseRef      string
+	CreationSha  string
 	WorktreePath string
 	PreservedRef string
 	State        string
@@ -157,6 +177,8 @@ func (q *Queries) UpsertSessionWorktree(ctx context.Context, arg UpsertSessionWo
 		arg.RepoName,
 		arg.Branch,
 		arg.BaseSha,
+		arg.BaseRef,
+		arg.CreationSha,
 		arg.WorktreePath,
 		arg.PreservedRef,
 		arg.State,
@@ -165,12 +187,14 @@ func (q *Queries) UpsertSessionWorktree(ctx context.Context, arg UpsertSessionWo
 }
 
 const upsertWorkspaceRepo = `-- name: UpsertWorkspaceRepo :exec
-INSERT INTO workspace_repos (project_id, name, relative_path, repo_origin_url, registered_at)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO workspace_repos (project_id, name, relative_path, repo_origin_url, default_branch, registered_at, git_status)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (project_id, name) DO UPDATE SET
     relative_path = excluded.relative_path,
     repo_origin_url = excluded.repo_origin_url,
-    registered_at = excluded.registered_at
+    default_branch = excluded.default_branch,
+    registered_at = excluded.registered_at,
+    git_status = excluded.git_status
 `
 
 type UpsertWorkspaceRepoParams struct {
@@ -178,7 +202,9 @@ type UpsertWorkspaceRepoParams struct {
 	Name          string
 	RelativePath  string
 	RepoOriginURL string
+	DefaultBranch string
 	RegisteredAt  time.Time
+	GitStatus     string
 }
 
 func (q *Queries) UpsertWorkspaceRepo(ctx context.Context, arg UpsertWorkspaceRepoParams) error {
@@ -187,7 +213,9 @@ func (q *Queries) UpsertWorkspaceRepo(ctx context.Context, arg UpsertWorkspaceRe
 		arg.Name,
 		arg.RelativePath,
 		arg.RepoOriginURL,
+		arg.DefaultBranch,
 		arg.RegisteredAt,
+		arg.GitStatus,
 	)
 	return err
 }

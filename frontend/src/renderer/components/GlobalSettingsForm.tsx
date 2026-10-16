@@ -1,35 +1,52 @@
-import { useNavigate } from "@tanstack/react-router";
-import { useState } from "react";
-import { Mail } from "lucide-react";
-import { ConnectMobileModal } from "./ConnectMobileModal";
-import { DeveloperModeSection } from "./settings/DeveloperModeSection";
-import { GeneralSettingsSection } from "./settings/GeneralSettingsSection";
-import { ReportProblemDialog } from "./settings/ReportProblemDialog";
-import { SettingsLinkRow } from "./settings/SettingsRow";
-import { SettingsPageShell } from "./settings/SettingsPageShell";
-import { SettingsPanel } from "./settings/SettingsPanel";
-import { SettingsSection } from "./settings/SettingsSection";
-import { UpdatesSection } from "./settings/UpdatesSection";
+import { Fragment, Suspense } from "react";
+import { useTranslation } from "react-i18next";
+import { type GlobalSettingsSection as GlobalSettingsPage, type HarnessDiagnosticsRequest, useUiStore } from "../stores/ui-store";
+import { globalSettingsItemsFor } from "./settings/settingsCatalog";
 
-export function GlobalSettingsForm() {
-	const navigate = useNavigate();
-	const [mobileOpen, setMobileOpen] = useState(false);
-	const [reportProblemOpen, setReportProblemOpen] = useState(false);
+export type GlobalSettingsSection = GlobalSettingsPage | "all";
+
+export function GlobalSettingsForm({
+	cloudEnabled = true,
+	customCoder = false,
+	selfServeBilling = false,
+	focusAgentId,
+	hostId,
+	harnessView,
+	startLogin,
+	showDiagnostics,
+	section = "all",
+}: {
+	cloudEnabled?: boolean;
+	/** The org's offering includes coder (SettingsDialog reads useCloudOffering). */
+	customCoder?: boolean;
+	/** The org is on self-serve billing. */
+	selfServeBilling?: boolean;
+	focusAgentId?: string;
+	hostId?: string;
+	harnessView?: "local" | "cloud";
+	startLogin?: boolean;
+	showDiagnostics?: HarnessDiagnosticsRequest;
+	section?: GlobalSettingsSection;
+}) {
+	const { t } = useTranslation();
+	const developerMode = useUiStore((state) => state.developerMode);
+	const diagnostics = useUiStore((state) => state.developerMode && state.diagnostics);
+	const all = section === "all";
+	const context = { cloudEnabled, developerMode, diagnostics, customCoder, selfServeBilling, focusAgentId, hostId, harnessView, startLogin, showDiagnostics };
+	// One section per page means the dialog header already names it, so a
+	// leading in-page heading would just repeat that title.
+	const titleHidden = !all;
 
 	return (
-		<>
-			<SettingsPageShell>
-				<SettingsPanel onClose={() => navigate({ to: "/" })}>
-					<GeneralSettingsSection onConnectMobile={() => setMobileOpen(true)} />
-					<UpdatesSection />
-					<DeveloperModeSection />
-					<SettingsSection title="Get help">
-						<SettingsLinkRow icon={Mail} label="Report a problem" onClick={() => setReportProblemOpen(true)} />
-					</SettingsSection>
-				</SettingsPanel>
-			</SettingsPageShell>
-			<ConnectMobileModal open={mobileOpen} onOpenChange={setMobileOpen} />
-			<ReportProblemDialog open={reportProblemOpen} onOpenChange={setReportProblemOpen} />
-		</>
+		<div
+			aria-label={t("settings.title")}
+			className="flex w-full flex-col gap-(--size-settings-section-gap)"
+		>
+			{globalSettingsItemsFor(section, context).map((item) => (
+				<Fragment key={item.id}>
+					<Suspense fallback={null}>{item.render(t, titleHidden, context)}</Suspense>
+				</Fragment>
+			))}
+		</div>
 	);
 }

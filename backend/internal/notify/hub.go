@@ -11,7 +11,7 @@ const subscriberBuffer = 64
 
 type subscription struct {
 	projectID domain.ProjectID
-	ch        chan domain.NotificationRecord
+	ch        chan domain.NotificationEvent
 }
 
 // Hub is an in-process publisher for notification SSE subscribers.
@@ -27,13 +27,13 @@ func NewHub() *Hub {
 }
 
 // Subscribe registers a live notification subscriber. Empty projectID receives all projects.
-func (h *Hub) Subscribe(projectID domain.ProjectID) (<-chan domain.NotificationRecord, func()) {
+func (h *Hub) Subscribe(projectID domain.ProjectID) (<-chan domain.NotificationEvent, func()) {
 	if h == nil {
-		ch := make(chan domain.NotificationRecord)
+		ch := make(chan domain.NotificationEvent)
 		close(ch)
 		return ch, func() {}
 	}
-	ch := make(chan domain.NotificationRecord, subscriberBuffer)
+	ch := make(chan domain.NotificationEvent, subscriberBuffer)
 	h.mu.Lock()
 	id := h.nextID
 	h.nextID++
@@ -49,21 +49,36 @@ func (h *Hub) Subscribe(projectID domain.ProjectID) (<-chan domain.NotificationR
 	}
 }
 
-// Publish pushes a persisted notification to matching subscribers without blocking lifecycle writes.
-func (h *Hub) Publish(_ context.Context, rec domain.NotificationRecord) error {
+// Publish pushes one notification event to matching subscribers without blocking lifecycle writes.
+func (h *Hub) Publish(_ context.Context, event domain.NotificationEvent) error {
 	if h == nil {
 		return nil
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, sub := range h.subs {
-		if sub.projectID != "" && sub.projectID != rec.ProjectID {
+		if event.Kind != domain.NotificationCleared && sub.projectID != "" && sub.projectID != event.Record.ProjectID {
 			continue
 		}
+		if event.Kind == domain.NotificationCleared {
+			// Clear supersedes every queued event. Making room here guarantees a
+			// slow subscriber observes the reset before any later notification.
+			drainNotificationEvents(sub.ch)
+		}
 		select {
-		case sub.ch <- rec:
+		case sub.ch <- event:
 		default:
 		}
 	}
 	return nil
+}
+
+func drainNotificationEvents(ch <-chan domain.NotificationEvent) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }

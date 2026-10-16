@@ -20,8 +20,7 @@ const (
 	copilotHooksDir      = ".github/hooks"
 	copilotHooksFileName = "ao.json"
 
-	copilotAgentsDir     = ".github/agents"
-	copilotAgentSentinel = "<!-- managed by agent-orchestrator: copilot agent profile -->"
+	copilotAgentsDir = ".github/agents"
 
 	// copilotHooksVersion is the schema version of the hooks file (Copilot uses 1).
 	copilotHooksVersion = 1
@@ -87,28 +86,44 @@ var copilotManagedHooks = []copilotHookSpec{
 	{Event: "agentStop", Command: "stop"},
 }
 
+// InstallAgentProfile installs only AO's per-session Copilot custom-agent
+// profile. Reviewers use this directly because their lifecycle is owned by the
+// review launcher, not the worker activity hooks.
+func (p *Plugin) InstallAgentProfile(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.WorkspacePath) == "" {
+		return errors.New("copilot.InstallAgentProfile: WorkspacePath is required")
+	}
+	if err := installCopilotAgent(cfg.WorkspacePath, cfg.SessionID, cfg.SystemPrompt, cfg.SystemPromptFile); err != nil {
+		return fmt.Errorf("copilot.InstallAgentProfile: %w", err)
+	}
+	return nil
+}
+
 // GetAgentHooks installs AO's Copilot workspace integration:
-//   - .github/hooks/ao.json for normalized activity-state signals.
 //   - .github/agents/ao-<session>.agent.md for an explicit per-session role.
+//   - .github/hooks/ao.json for normalized activity-state signals.
 //
 // The launch command selects that profile with --agent=ao-<session>. Avoid
 // writing a repository-root AGENTS.md here so AO does not compete with
 // project-owned instructions.
 func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfig) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if strings.TrimSpace(cfg.WorkspacePath) == "" {
-		return errors.New("copilot.GetAgentHooks: WorkspacePath is required")
-	}
-	if err := installCopilotAgent(cfg.WorkspacePath, cfg.SessionID, cfg.SystemPrompt, cfg.SystemPromptFile); err != nil {
+	if err := p.InstallAgentProfile(ctx, cfg); err != nil {
 		return fmt.Errorf("copilot.GetAgentHooks: %w", err)
 	}
+	if err := installCopilotHooks(cfg.WorkspacePath); err != nil {
+		return fmt.Errorf("copilot.GetAgentHooks: %w", err)
+	}
+	return nil
+}
 
-	hooksPath := copilotHooksPath(cfg.WorkspacePath)
+func installCopilotHooks(workspacePath string) error {
+	hooksPath := copilotHooksPath(workspacePath)
 	file, err := readCopilotHooks(hooksPath)
 	if err != nil {
-		return fmt.Errorf("copilot.GetAgentHooks: %w", err)
+		return err
 	}
 
 	if file.Hooks == nil {
@@ -128,10 +143,10 @@ func (p *Plugin) GetAgentHooks(ctx context.Context, cfg ports.WorkspaceHookConfi
 	}
 
 	if err := writeCopilotHooks(hooksPath, file); err != nil {
-		return fmt.Errorf("copilot.GetAgentHooks: %w", err)
+		return err
 	}
 	if err := hookutil.EnsureWorkspaceGitignore(filepath.Dir(hooksPath), copilotHooksFileName); err != nil {
-		return fmt.Errorf("copilot.GetAgentHooks: gitignore: %w", err)
+		return fmt.Errorf("gitignore: %w", err)
 	}
 	return nil
 }
@@ -150,7 +165,7 @@ func installCopilotAgent(workspacePath, sessionID, inlinePrompt, promptFile stri
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read %s: %w", agentPath, err)
 	}
-	if err == nil && !strings.Contains(string(existing), copilotAgentSentinel) {
+	if err == nil && !strings.Contains(string(existing), hookutil.CopilotAgentProfileSentinel) {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(agentPath), 0o750); err != nil {
@@ -172,7 +187,7 @@ func copilotAgentProfile(agentName, sessionID, systemPrompt string) string {
 		"description: Agent Orchestrator role profile for AO session " + strings.TrimSpace(sessionID) + ". Use for all work in this session.\n" +
 		"target: github-copilot\n" +
 		"---\n\n" +
-		copilotAgentSentinel + "\n\n" +
+		hookutil.CopilotAgentProfileSentinel + "\n\n" +
 		strings.TrimRight(systemPrompt, "\n") + "\n"
 }
 
