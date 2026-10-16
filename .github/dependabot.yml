@@ -1,6 +1,51 @@
 version: 2
 updates:
-  - package-ecosystem: "n
+  # The npm entry was truncated to `package-ecosystem: "n` (invalid YAML), which
+  # disabled version updates and left only ungrouped security PRs.
+  # Multi-directory entry: one grouped PR per ecosystem instead of one PR per package.
+  - package-ecosystem: "npm"
+    directories:
+      - "/"
+      - "/frontend"
+      - "/frontend/acp-runtime"
+      - "/frontend/src/docs"
+      - "/packages/cloud-client"
+      - "/packages/mobile"
+      - "/packages/product-ui"
+      - "/scripts"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  - package-ecosystem: "gomod"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      gomod-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
